@@ -7,6 +7,7 @@ import json
 from bs4 import BeautifulSoup
 import subprocess
 import time
+import os
 def get_cookies(name, password):
     edge_options = Options()
     edge_options.add_argument("--headless")   
@@ -49,6 +50,7 @@ def sccourse(cookies, courseid):
     result = subprocess.run(curl_cmd, capture_output=True, text=True, check=True,encoding="utf-8")
     return result.stdout
 if __name__ == "__main__":
+    print(os.getcwd())
     with open("accounts.json", "r", encoding="utf-8") as f:
         accounts_data = json.load(f)["accounts"]
 
