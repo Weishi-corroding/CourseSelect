@@ -1,0 +1,7 @@
+PyQt5
+selenium
+beautifulsoup4
+pyinstaller
+requests
+# 可根据需要添加其他依赖，例如 webdriver 管理工具
+Pillow
