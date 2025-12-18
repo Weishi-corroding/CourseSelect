@@ -97,6 +97,7 @@ FILES = {
     "accounts": "accounts.json",
     "courses": "courses.json",
     "cookies": "cookies.json",
+    "delete_courses": "delete_courses.json",
 }
 
 # 学选课系统 URL
