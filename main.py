@@ -17,7 +17,7 @@ from dialogs import StyledMessageBox, get_text_input, get_multiline_input
 from threads import CourseSelectionThread
 from core import (
     load_accounts, save_accounts, load_courses, save_courses,
-    load_cookies_dict, save_cookies_dict
+    load_cookies_dict, save_cookies_dict, load_delete_courses, save_delete_courses
 )
 
 
@@ -40,6 +40,7 @@ class MainWindow(QMainWindow):
         self.menu_bar.import_accounts_action.triggered.connect(self.import_accounts_file)
         self.menu_bar.new_course_action.triggered.connect(self.new_course_list)
         self.menu_bar.new_account_action.triggered.connect(self.new_account_dialog)
+        self.menu_bar.new_delete_course_action.triggered.connect(self.new_delete_course_list)
         self.menu_bar.update_cookie_action.triggered.connect(self.update_cookie_for_user)
         self.menu_bar.settings_action.triggered.connect(self.show_settings)
         
@@ -77,14 +78,33 @@ class MainWindow(QMainWindow):
         self.user_info_label.setFont(QFont("Arial", 11))
         self.layout.addWidget(self.user_info_label)
         
-        # 课程列表显示
+        # 课程列表显示区域 - 拆分为左右两个窗口
+        courses_layout = QHBoxLayout()
+        
+        # 左边：待选课程
+        left_layout = QVBoxLayout()
         self.course_info_label = QLabel("待选课程:")
         self.course_info_label.setFont(QFont("Arial", 11))
-        self.layout.addWidget(self.course_info_label)
+        left_layout.addWidget(self.course_info_label)
         
         self.course_display = QTextEdit()
         self.course_display.setReadOnly(True)
-        self.layout.addWidget(self.course_display)
+        left_layout.addWidget(self.course_display)
+        
+        # 右边：待删除课程
+        right_layout = QVBoxLayout()
+        self.delete_course_info_label = QLabel("待删除课程:")
+        self.delete_course_info_label.setFont(QFont("Arial", 11))
+        right_layout.addWidget(self.delete_course_info_label)
+        
+        self.delete_course_display = QTextEdit()
+        self.delete_course_display.setReadOnly(True)
+        right_layout.addWidget(self.delete_course_display)
+        
+        # 将左右两个布局添加到水平布局中
+        courses_layout.addLayout(left_layout)
+        courses_layout.addLayout(right_layout)
+        self.layout.addLayout(courses_layout)
         
         # 注意：启动时不加载用户，保持下拉菜单为空
         # self.load_users()
@@ -121,6 +141,7 @@ class MainWindow(QMainWindow):
         if not username:
             self.user_info_label.setText("")
             self.course_display.setText("")
+            self.delete_course_display.setText("")
             return
         
         # 读取并显示用户信息
@@ -134,7 +155,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self.user_info_label.setText("")
         
-        # 读取并显示该用户的课程列表
+        # 读取并显示该用户的待选课程列表
         try:
             courses_data = load_courses()
             courses = courses_data.get(username, [])
@@ -144,6 +165,21 @@ class MainWindow(QMainWindow):
                 self.course_display.setText(f"(未在 courses.json 中找到该用户的课程列表)")
         except Exception:
             self.course_display.setText("(未找到 courses.json 或读取失败)")
+        
+        # 读取并显示该用户的待删除课程列表
+        try:
+            from core import load_delete_courses
+            delete_courses_data = load_delete_courses()
+            delete_courses = delete_courses_data.get(username, [])
+            if delete_courses:
+                delete_courses_str = "\n".join(
+                    f"{c['courseCode']} (班序:{c['classNo']})" for c in delete_courses
+                )
+                self.delete_course_display.setText(delete_courses_str)
+            else:
+                self.delete_course_display.setText("(无待删除课程)")
+        except Exception:
+            self.delete_course_display.setText("(未找到 delete_courses.json 或读取失败)")
     
     def load_users(self):
         """加载用户列表到下拉框"""
@@ -238,6 +274,43 @@ class MainWindow(QMainWindow):
             if self.user_combo.currentText() == name:
                 self.on_user_selected(name)
     
+    def new_delete_course_list(self):
+        """创建待删除课程列表"""
+        name, ok1 = get_text_input(self, '待删除课程', '请输入选课人名称:')
+        if not ok1 or not name.strip():
+            return
+        
+        text, ok2 = get_multiline_input(self, '待删除课程', '请输入课程信息，每行格式：课程代码 班序\n例如：COMP101 1')
+        if ok2 and text.strip():
+            from core import load_delete_courses, save_delete_courses
+            
+            delete_courses = []
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        course_code = parts[0]
+                        class_no = parts[1]
+                        delete_courses.append({
+                            "courseCode": course_code,
+                            "classNo": class_no
+                        })
+            
+            if delete_courses:
+                # 读取/创建 delete_courses.json
+                delete_courses_data = load_delete_courses()
+                delete_courses_data[name] = delete_courses
+                save_delete_courses(delete_courses_data)
+                
+                StyledMessageBox.information(self, '已创建', f'已为 {name} 创建待删除课程列表，共 {len(delete_courses)} 门')
+                
+                # 如果当前选中该用户，刷新显示
+                if self.user_combo.currentText() == name:
+                    self.on_user_selected(name)
+            else:
+                StyledMessageBox.warning(self, '错误', '输入格式错误，请按 "课程代码 班序" 的格式输入')
+    
     def new_account_dialog(self):
         """创建新账户"""
         from dialogs import get_account_input
@@ -305,21 +378,39 @@ class MainWindow(QMainWindow):
             # 调用 get_cookies 获取 cookies
             from core import get_cookies
             # 将 GUI 的状态写入函数作为回调传入，使得登录过程的进度可以显示在状态框中
+            self.status_box.append("开始调用 get_cookies 函数...")
             cookies = get_cookies(username, password, report_callback=self.status_box.append)
             
+            self.status_box.append(f"[调试] 获得的 cookies 对象类型: {type(cookies)}")
+            self.status_box.append(f"[调试] 获得的 cookies 数量: {len(cookies)}")
+            
             # 转换为字符串格式
-            cookies_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+            try:
+                self.status_box.append("开始转换 cookies 为字符串格式...")
+                cookies_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                self.status_box.append(f"[调试] 转换成功，cookies 字符串长度: {len(cookies_str)}")
+            except Exception as convert_error:
+                self.status_box.append(f"❌ Cookies 转换失败: {convert_error}")
+                raise
             
             # 保存到 cookies.json
-            cookies_dict = load_cookies_dict()
-            cookies_dict[selected_user] = cookies_str
-            save_cookies_dict(cookies_dict)
+            try:
+                self.status_box.append("开始保存 cookies 到 cookies.json...")
+                cookies_dict = load_cookies_dict()
+                cookies_dict[selected_user] = cookies_str
+                save_cookies_dict(cookies_dict)
+                self.status_box.append("✓ Cookies 已保存到文件")
+            except Exception as save_error:
+                self.status_box.append(f"❌ Cookies 保存失败: {save_error}")
+                raise
             
             self.status_box.append(f"✓ 已成功获取 {selected_user} 的 Cookie")
             StyledMessageBox.information(self, '已更新', f'已为 {selected_user} 成功获取并保存 Cookie')
             self.on_user_selected(selected_user)
         except Exception as e:
+            import traceback
             self.status_box.append(f"✗ 获取 Cookie 失败: {e}")
+            self.status_box.append(f"错误详情: {traceback.format_exc()}")
             StyledMessageBox.warning(self, '错误', f'无法获取 Cookie: {e}')
     
     def toggle_selection(self):
@@ -378,8 +469,9 @@ class MainWindow(QMainWindow):
         if not cookies_str:
             self.update_status(f"用户 {selected_user} 的 cookie 为空，需要更新。")
         
-        self.thread = CourseSelectionThread(cookies_str, courses, username, password, self.request_interval)
+        self.thread = CourseSelectionThread(cookies_str, courses, username, password, selected_user, self.request_interval)
         self.thread.update_status.connect(self.update_status)
+        self.thread.refresh_courses.connect(self.on_user_selected)  # 连接课程刷新信号
         self.thread.start()
         
         # 改变按钮为停止状态
