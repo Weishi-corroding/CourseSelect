@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<InstallForgeProject>
+  <Metadata productVersion="1.6.1" projectFileVersion="2.0"/>
+  <ProductInformation>
+    <Name>CourseSelect</Name>
+    <Version>1.2</Version>
+    <CompanyName/>
+    <WebURI>https://</WebURI>
+  </ProductInformation>
+  <InstallerConfiguration>
+    <Prerequisites>
+      <OperatingSystem check="true">
+        <WindowsXP>false</WindowsXP>
+        <WindowsServer2003>true</WindowsServer2003>
+        <WindowsVista>true</WindowsVista>
+        <WindowsServer2008>true</WindowsServer2008>
+        <Windows7>true</Windows7>
+        <Windows8>true</Windows8>
+        <Windows10>true</Windows10>
+        <WindowsServer2016>true</WindowsServer2016>
+        <WindowsServer2019>true</WindowsServer2019>
+        <WindowsServer2022>true</WindowsServer2022>
+        <Windows11>true</Windows11>
+        <WindowsServer2025>true</WindowsServer2025>
+      </OperatingSystem>
+    </Prerequisites>
+    <UserInterface>
+      <WizardImage filePath="&lt;main&gt;"/>
+      <HeaderImage filePath="&lt;main&gt;"/>
+      <Label isEnabled="true"/>
+      <VisualStyle isEnabled="true"/>
+    </UserInterface>
+    <InstallationFiles defaultInstallationPath="&lt;ProgramFiles&gt;\&lt;AppName&gt;\" isDefaultInstallationPathAlterable ="true">
+      <InstallationFile size="3.4 MB" type="exe">D:\CourseSelect\dist\CourseSelect\CourseSelect.exe</InstallationFile>
+      <InstallationFile size="N/A" type="[Folder]">D:\CourseSelect\dist\CourseSelect\_internal\</InstallationFile>
+      <InstallationFile size="N/A" type="[Folder]">D:\CourseSelect\dist\CourseSelect\chrome\</InstallationFile>
+    </InstallationFiles>
+    <Languages>
+      <Language>English</Language>
+      <Language>简体中文</Language>
+    </Languages>
+    <Variables/>
+    <Commands/>
+    <Registry/>
+    <Shortcuts defaultPath="&lt;AppName&gt;\" isDefaultPathAlterable="false" isCreateStartmenuShortcutsForAllUsers="false" isCreateDesktopShortcutsForAllUsers="false">
+      <Shortcut destination="Desktop" name="CourseSelect" targetFile="&lt;InstallPath&gt;\CourseSelect.exe" commandLineArguments="" iconFilePath="&lt;InstallPath&gt;\CourseSelect.exe" iconIndex="0"/>
+      <Shortcut destination="Startmenu" name="CourseSelect" targetFile="&lt;InstallPath&gt;\CourseSelect.exe" commandLineArguments="" iconFilePath="&lt;InstallPath&gt;\CourseSelect.exe" iconIndex="0"/>
+    </Shortcuts>
+    <Serials isDialogEnabled="false" count="1000" mask ="#####-#####-#####-#####"/>
+    <SplashScreen isDialogEnabled="false" delayTime="2">
+      <Image filePath=""/>
+      <Sound isEnabled="false" filePath=""/>
+    </SplashScreen>
+    <License isDialogEnabled="false">
+      <Data>e1xydGYxXGFuc2lcYW5zaWNwZzkzNlxkZWZmMFxub3VpY29tcGF0XGRlZmxhbmcxMDMzXGRlZmxhbmdmZTIwNTJ7XGZvbnR0Ymx7XGYwXGZuaWwgQXJpYWw7fX0NCntcKlxnZW5lcmF0b3IgUmljaGVkMjAgMTAuMC4yNjEwMH1cdmlld2tpbmQ0XHVjMSANClxwYXJkXGYwXGZzMjBcbGFuZzIwNTJccGFyDQp9DQoA</Data>
+    </License>
+    <Finish isRebootMachineEnabled="false">
+      <Program executableFilePath="&lt;InstallPath&gt;\CourseSelect.exe" isLaunchEnabled="true" arguments=""/>
+    </Finish>
+  </InstallerConfiguration>
+  <UninstallerConfiguration isPackaged="true">
+    <UninstallerExecutableFileName>Uninst</UninstallerExecutableFileName>
+    <OpenWebURIAfterUninstallation isEnabled="false">https://</OpenWebURIAfterUninstallation>
+    <CustomDisplayIcon isEnabled="false" iconFilePath="&lt;InstallPath&gt;\"/>
+  </UninstallerConfiguration>
+  <VisualUpdateConfiguration isPackaged="false">
+    <ProductName>&lt;AppName&gt;</ProductName>
+    <ProductVersion>&lt;AppVersion&gt;</ProductVersion>
+    <Language>0</Language>
+    <UpdateScriptURIs>
+      <MainURI>https://</MainURI>
+      <FirstMirrorURI>https://</FirstMirrorURI>
+      <SecondMirrorURI>https://</SecondMirrorURI>
+    </UpdateScriptURIs>
+    <updateExecutableFileName>Update</updateExecutableFileName>
+    <proEditionLicenseKey/>
+    <Program executableFilePath="" isLaunchEnabled="false" isTerminationEnabled="false"/>
+  </VisualUpdateConfiguration>
+  <BuildConfiguration>
+    <SetupFilePath>D:\CourseSelect_setup.exe</SetupFilePath>
+    <SetupIconPath>C:\Program Files (x86)\solicus\InstallForge\icons\super-modern.ico</SetupIconPath>
+    <UninstallerIconPath>D:\CourseSelect\logo.ico</UninstallerIconPath>
+    <Compression method="0" level="2"/>
+    <CodeSigning isEnabled="false" signToolCommandLine="/n &quot;Subject&quot; /tr http://timestamp.digicert.com /td sha256 /fd sha256 &quot;&lt;ExecutableFilePath&gt;&quot;"/>
+  </BuildConfiguration>
+</InstallForgeProject>

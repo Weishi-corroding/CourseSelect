@@ -1,0 +1,124 @@
+[2025-12-28 00:14:41] [INFO] 程序启动，日志系统已初始化...
+[2025-12-28 00:14:42] [INFO] 主窗口已显示
+[2025-12-29 23:17:30] [INFO] 程序启动，日志系统已初始化...
+[2025-12-29 23:17:31] [INFO] 主窗口已显示
+[2025-12-29 23:17:49] [CORE] --- 开始任务 (Edge): 250200323 ---
+[2025-12-29 23:17:49] [CORE] 正在启动 Edge WebDriver...
+[2025-12-29 23:22:34] [INFO] 程序启动，日志系统已初始化...
+[2025-12-29 23:22:35] [INFO] 主窗口已显示
+[2025-12-29 23:22:43] [CORE] --- 开始任务 (Edge): 251310625 ---
+[2025-12-29 23:22:43] [CORE] 正在启动 Edge WebDriver...
+[2025-12-29 23:22:47] [CORE] ✅ Edge 启动成功！
+[2025-12-29 23:22:47] [CORE] 打开登录页: https://jwgl.dhu.edu.cn/dhu/casLogin
+[2025-12-29 23:22:59] [CORE] ❌ 核心异常:
+Traceback (most recent call last):
+  File "d:\CourseSelect\core.py", line 91, in get_cookies
+    WebDriverWait(driver, 15).until(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        EC.presence_of_element_located((By.NAME, "input"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ).send_keys(name)
+    ^
+  File "D:\CourseSelect\.venv\Lib\site-packages\selenium\webdriver\support\wait.py", line 113, in until
+    value = method(self._driver)
+  File "D:\CourseSelect\.venv\Lib\site-packages\selenium\webdriver\support\expected_conditions.py", line 92, in _predicate
+    return driver.find_element(*locator)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\CourseSelect\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 802, in find_element
+    return self.execute(Command.FIND_ELEMENT, {"using": by, "value": value})["value"]
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\CourseSelect\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 432, in execute
+    self.error_handler.check_response(response)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\CourseSelect\.venv\Lib\site-packages\selenium\webdriver\remote\errorhandler.py", line 232, in check_response
+    raise exception_class(message, screen, stacktrace)
+selenium.common.exceptions.NoSuchWindowException: Message: no such window: target window already closed
+from unknown error: web view not found
+  (Session info: MicrosoftEdge=143.0.3650.96)
+Stacktrace:
+Symbols not available. Dumping unresolved backtrace:
+	0x7ff67d5a87c5
+	0x7ff67d518e34
+	0x7ff67d903222
+	0x7ff67d3106a8
+	0x7ff67d397268
+	0x7ff67d3ac212
+	0x7ff67d36982a
+	0x7ff67d368b33
+	0x7ff67d369653
+	0x7ff67d4522e4
+	0x7ff67d46109c
+	0x7ff67d45ac7f
+	0x7ff67d639b27
+	0x7ff67d524696
+	0x7ff67d51eaa4
+	0x7ff67d51ebe9
+	0x7ff67d512cad
+	0x7ffb7bdfe8d7
+	0x7ffb7cd0c53c
+
+
+[2025-12-29 23:23:01] [CORE] --- 流程结束 ---
+[2025-12-30 12:05:42] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 12:05:43] [INFO] 主窗口已显示
+[2025-12-30 12:05:52] [CORE] --- 开始任务 (Edge): 251310625 ---
+[2025-12-30 12:05:52] [CORE] 正在启动 Edge WebDriver...
+[2025-12-30 12:05:57] [CORE] ✅ Edge 启动成功！
+[2025-12-30 12:05:57] [CORE] 打开登录页: https://jwgl.dhu.edu.cn/dhu/casLogin
+[2025-12-30 12:07:24] [CORE] 登录提交，等待 JSESSIONID...
+[2025-12-30 12:12:25] [CORE] ✅ 成功捕获教务系统 Session！
+[2025-12-30 12:12:27] [CORE] --- 流程结束 ---
+[2025-12-30 12:49:21] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 12:49:21] [INFO] 主窗口已显示
+[2025-12-30 12:51:41] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 12:51:41] [INFO] 主窗口已显示
+[2025-12-30 12:59:49] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 12:59:49] [INFO] 主窗口已显示
+[2025-12-30 13:00:39] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 13:00:40] [INFO] 主窗口已显示
+[2025-12-30 13:02:22] [CORE] --- 开始任务 (Edge): 230622200701071582 ---
+[2025-12-30 13:02:22] [CORE] 正在启动 Edge WebDriver...
+[2025-12-30 13:02:24] [CORE] ✅ Edge 启动成功！
+[2025-12-30 13:02:24] [CORE] 打开登录页: https://jwgl.dhu.edu.cn/dhu/casLogin
+[2025-12-30 13:03:14] [CORE] 登录提交，等待 JSESSIONID...
+[2025-12-30 13:08:15] [CORE] ✅ 成功捕获教务系统 Session！
+[2025-12-30 13:08:17] [CORE] --- 流程结束 ---
+[2025-12-30 13:23:34] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 13:23:34] [INFO] 主窗口已显示
+[2025-12-30 13:28:59] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 13:28:59] [INFO] 主窗口已显示
+[2025-12-30 13:32:46] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 13:32:47] [INFO] 主窗口已显示
+[2025-12-30 13:32:54] [CORE] --- 开始任务 (Edge): 251310624 ---
+[2025-12-30 13:32:54] [CORE] 正在启动 Edge WebDriver...
+[2025-12-30 13:32:58] [CORE] ✅ Edge 启动成功！
+[2025-12-30 13:32:58] [CORE] 打开登录页: https://jwgl.dhu.edu.cn/dhu/casLogin
+[2025-12-30 13:33:23] [CORE] 登录提交，等待 JSESSIONID...
+[2025-12-30 13:35:45] [CORE] ✅ 成功捕获教务系统 Session！
+[2025-12-30 13:35:47] [CORE] --- 流程结束 ---
+[2025-12-30 14:19:09] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 14:19:10] [INFO] 主窗口已显示
+[2025-12-30 16:59:42] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 16:59:42] [INFO] 主窗口已显示
+[2025-12-30 16:59:45] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 16:59:46] [INFO] 主窗口已显示
+[2025-12-30 17:28:11] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 17:28:11] [INFO] 主窗口已显示
+[2025-12-30 17:28:58] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 17:28:58] [INFO] 主窗口已显示
+[2025-12-30 17:31:51] [CORE] --- 开始任务 (edge): 251310625 ---
+[2025-12-30 17:31:51] [CORE] 正在启动 Edge WebDriver...
+[2025-12-30 17:31:55] [CORE] ✅ Edge 启动成功！
+[2025-12-30 17:31:55] [CORE] 打开登录页: https://jwgl.dhu.edu.cn/dhu/casLogin
+[2025-12-30 17:31:57] [CORE] 登录提交，等待 JSESSIONID...
+[2025-12-30 17:31:59] [CORE] ✅ 成功捕获教务系统 Session！
+[2025-12-30 17:32:01] [CORE] --- 流程结束 ---
+[2025-12-30 17:41:43] [CORE] --- 开始任务 (edge): 251050106 ---
+[2025-12-30 17:41:43] [CORE] 正在启动 Edge WebDriver...
+[2025-12-30 17:41:44] [CORE] ✅ Edge 启动成功！
+[2025-12-30 17:41:44] [CORE] 打开登录页: https://jwgl.dhu.edu.cn/dhu/casLogin
+[2025-12-30 17:41:46] [CORE] 登录提交，等待 JSESSIONID...
+[2025-12-30 17:41:50] [CORE] ✅ 成功捕获教务系统 Session！
+[2025-12-30 17:41:52] [CORE] --- 流程结束 ---
+[2025-12-30 18:21:03] [INFO] 程序启动，日志系统已初始化...
+[2025-12-30 18:21:03] [INFO] 主窗口已显示
