@@ -10,6 +10,8 @@ import traceback
 import urllib.request
 import urllib.parse
 
+import requests
+
 # Selenium imports
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -35,6 +37,100 @@ FILES = {
 LOG_FILE = "CoureseSelectDebug.log"
 
 LOGIN_URL = "https://jwgl.dhu.edu.cn/dhu/casLogin"
+# ... (保留 core.py 前面的所有代码) ...
+
+def _requests_post(url, data, cookies, headers_extra=None, timeout=15):
+    """requests.post 的统一封装，返回响应文本"""
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        "Connection": "keep-alive",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Origin": "https://jwgl.dhu.edu.cn",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+        "X-Requested-With": "XMLHttpRequest",
+        "sec-ch-ua": '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Cookie": cookies,
+    }
+    if headers_extra:
+        headers.update(headers_extra)
+    try:
+        resp = requests.post(url, data=data, headers=headers, timeout=timeout)
+        return resp.text
+    except requests.exceptions.Timeout:
+        return "TIMEOUT"
+    except Exception:
+        return ""
+
+def access_judge(cookies, course_code):
+    """
+    [模拟手工操作步骤1] 访问权限检查
+    """
+    url = "https://jwgl.dhu.edu.cn/dhu/selectcourse/accessJudge"
+    post_data = f"courseCode={course_code}"
+    extra = {"Referer": "https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC"}
+    return _requests_post(url, post_data, cookies, headers_extra=extra, timeout=10)
+
+def query_course_info(cookies, course_code):
+    """
+    [模拟手工操作步骤2] 获取班级列表 (initACC)
+    参数完全复刻 DataTables 的请求格式
+    """
+    target_url = "https://jwgl.dhu.edu.cn/dhu/selectcourse/initACC"
+    
+    # 构造 DataTables 所需的巨大参数串 (直接复制你提供的 curl data)
+    post_data = (
+        "sEcho=1&iColumns=10&sColumns=&iDisplayStart=0&iDisplayLength=-1"
+        "&mDataProp_0=cttId&mDataProp_1=classNo&mDataProp_2=maxCnt"
+        "&mDataProp_3=applyCnt&mDataProp_4=enrollCnt&mDataProp_5=priorMajors"
+        "&mDataProp_6=techName&mDataProp_7=cttId&mDataProp_8=cttId&mDataProp_9=cttId"
+        "&iSortCol_0=0&sSortDir_0=asc&iSortingCols=1"
+        "&bSortable_0=false&bSortable_1=false&bSortable_2=false&bSortable_3=false"
+        "&bSortable_4=false&bSortable_5=false&bSortable_6=false&bSortable_7=false"
+        "&bSortable_8=false&bSortable_9=false"
+        f"&courseCode={course_code}"
+    )
+
+    curl_cmd = [
+        "curl", target_url,
+        "-H", "Accept: application/json, text/javascript, */*; q=0.01",
+        "-H", "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        "-H", "Connection: keep-alive",
+        "-H", "Content-Type: application/x-www-form-urlencoded;charset=UTF-8",
+        "-H", "Origin: https://jwgl.dhu.edu.cn",
+        "-H", "Referer: https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC",
+        "-H", "Sec-Fetch-Dest: empty",
+        "-H", "Sec-Fetch-Mode: cors",
+        "-H", "Sec-Fetch-Site: same-origin",
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+        "-H", "X-Requested-With: XMLHttpRequest",
+        "-H", 'sec-ch-ua: "Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+        "-H", "sec-ch-ua-mobile: ?0",
+        "-H", 'sec-ch-ua-platform: "Windows"',
+        "-H", f"Cookie: {cookies}",
+        "--data-raw", post_data,
+        "--compressed", "-s", "--max-time", "10"
+    ]
+def query_course_info(cookies, course_code):
+    """
+    [模拟手工操作步骤2] 获取班级列表 (initACC)
+    """
+    url = "https://jwgl.dhu.edu.cn/dhu/selectcourse/initACC"
+    post_data = (
+        "sEcho=1&iColumns=10&sColumns=&iDisplayStart=0&iDisplayLength=-1"
+        "&mDataProp_0=cttId&mDataProp_1=classNo&mDataProp_2=maxCnt"
+        "&mDataProp_3=applyCnt&mDataProp_4=enrollCnt&mDataProp_5=priorMajors"
+        "&mDataProp_6=techName&mDataProp_7=cttId&mDataProp_8=cttId&mDataProp_9=cttId"
+        "&iSortCol_0=0&sSortDir_0=asc&iSortingCols=1"
+        "&bSortable_0=false&bSortable_1=false&bSortable_2=false&bSortable_3=false"
+        "&bSortable_4=false&bSortable_5=false&bSortable_6=false&bSortable_7=false"
+        "&bSortable_8=false&bSortable_9=false"
+        f"&courseCode={course_code}"
+    )
+    extra = {"Referer": "https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC"}
+    return _requests_post(url, post_data, cookies, headers_extra=extra, timeout=10)
 
 def _log_to_file(msg):
     try:
@@ -51,7 +147,7 @@ def _log_to_file(msg):
     except:
         pass
 
-def get_cookies(name, password, report_callback=None, debug_mode=False, browser_type="edge"):
+def get_cookies(name, password, report_callback=None, browser_type="edge"):
     def _report(msg):
         _log_to_file(msg)
         try:
@@ -74,8 +170,9 @@ def get_cookies(name, password, report_callback=None, debug_mode=False, browser_
             # ========================================================
             # Chrome Portable 路径配置
             # ========================================================
-            chrome_bin_path = os.path.join(base_path, "chrome", "chrome.exe")
-            chromedriver_path = os.path.join(base_path, "chrome", "chromedriver.exe")
+            chrome_folder = os.path.join(base_path, "chrome")
+            chrome_bin_path = os.path.join(chrome_folder, "chrome", "chrome.exe")
+            chromedriver_path = os.path.join(chrome_folder, "chrome", "chromedriver.exe")
 
             # 检查文件是否存在，方便调试
             if not os.path.exists(chrome_bin_path):
@@ -90,14 +187,10 @@ def get_cookies(name, password, report_callback=None, debug_mode=False, browser_
             chrome_options = ChromeOptions()
             # 【重要】指定 Chrome 二进制文件位置
             chrome_options.binary_location = chrome_bin_path
-            
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-gpu")
+
             chrome_options.add_argument("--start-maximized")
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
+            # 注意: excludeSwitches 会导致 Chrome 149+ 崩溃，已移除
             
             # 【重要】使用 Service 指定 chromedriver.exe 路径
             service = ChromeService(executable_path=chromedriver_path)
@@ -111,26 +204,26 @@ def get_cookies(name, password, report_callback=None, debug_mode=False, browser_
             _report("✅ Chrome Portable 启动成功！")
             
         else:
-            # --- Edge 配置 (保持默认，使用系统安装的 Edge) ---
+            # --- Edge 配置 (使用系统安装的 Edge) ---
             edge_options = EdgeOptions()
-            edge_options.add_argument("--disable-dev-shm-usage")
-            edge_options.add_argument("--no-sandbox")
-            edge_options.add_argument("--disable-gpu")
             edge_options.add_argument("--start-maximized")
             edge_options.add_argument("--disable-blink-features=AutomationControlled")
-            edge_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            edge_options.add_experimental_option('useAutomationExtension', False)
-            
+            # 注意: excludeSwitches 会导致 Edge 149+ 崩溃，已移除
+
             _report("正在启动 Edge WebDriver...")
             driver = webdriver.Edge(options=edge_options)
             _report("✅ Edge 启动成功！")
         
         _report(f"打开登录页: {LOGIN_URL}")
+        # 跟随重定向到 CAS 统一认证页面 (cas.dhu.edu.cn)
         driver.get(LOGIN_URL)
-        
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.NAME, "input"))).send_keys(name)
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, '//input[@type="password"]'))).send_keys(password)
-        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, '//button[@title="登录"]'))).click()
+
+        # 等待 CAS 页面 JS 渲染完成后再操作表单
+        time.sleep(2)
+
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']"))).send_keys(name)
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']"))).send_keys(password)
+        WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "登录")]'))).click()
         
         _report("登录提交，等待 JSESSIONID...")
 
@@ -209,6 +302,16 @@ def cancelSC(cookies, courseCode, classNo):
         return result.stdout
     except subprocess.TimeoutExpired: return "TIMEOUT"
     except Exception as e: return f"EXCEPTION: {e}"
+def cancelSC(cookies, courseCode, classNo):
+    url = "https://jwgl.dhu.edu.cn/dhu/selectcourse/cancelSC"
+    post_data = f"courseCode={courseCode}&classNo={classNo}&cancelType=2"
+    extra = {"Referer": "https://jwgl.dhu.edu.cn/dhu/selectcourse/toSSC"}
+    result = _requests_post(url, post_data, cookies, headers_extra=extra, timeout=60)
+    if result == "TIMEOUT":
+        return "TIMEOUT"
+    if not result:
+        return "CURL ERROR: empty response"
+    return result
 
 def sccourse(cookies, courseid):
     target_url = "https://jwgl.dhu.edu.cn/dhu/selectcourse/scSubmit"
@@ -243,6 +346,18 @@ def sccourse(cookies, courseid):
         return result.stdout
     except subprocess.TimeoutExpired: return "TIMEOUT"
     except Exception as e: return f"EXCEPTION: {e}"
+def sccourse(cookies, courseid, cap_code=""):
+    url = "https://jwgl.dhu.edu.cn/dhu/selectcourse/scSubmit"
+    post_data = f"cttId={courseid}&needMaterial=false"
+    if cap_code:
+        post_data += f"&capCode={cap_code}"
+    extra = {"Referer": "https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC"}
+    result = _requests_post(url, post_data, cookies, headers_extra=extra, timeout=60)
+    if result == "TIMEOUT":
+        return "TIMEOUT"
+    if not result:
+        return "CURL ERROR: empty response"
+    return result
 
 def load_accounts():
     try:

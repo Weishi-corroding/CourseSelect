@@ -1,1 +1,31 @@
 cookies.json
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Browser drivers
+msedgedriver.exe
+chromedriver.exe
+
+# Chrome portable
+chrome/
+
+# Debug logs
+CoureseSelectDebug.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

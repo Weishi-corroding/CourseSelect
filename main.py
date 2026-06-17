@@ -81,6 +81,7 @@ def main():
         return os.path.join(os.path.dirname(__file__), relative_path)
 
     app = QApplication([])
+    app.setStyle("Fusion")
     
     # 尝试加载应用图标
     try:

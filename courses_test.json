@@ -1,0 +1,110 @@
+{
+  "meta": {
+    "term_id": 88,
+    "user": "朱思闻",
+    "fetch_time": "2026-06-16 10:55:09",
+    "total_courses": 1876,
+    "fetched_detail_count": 3
+  },
+  "courses": [
+    {
+      "id": "30603",
+      "kcbh": "010004",
+      "kcmc": "集成电路器件与工艺",
+      "xf": "3",
+      "orgname": "物理学院",
+      "jxdg_url": "/data/dhu_jw/sftp/upload/course/21/010004_3e8c4ec4-e73f-4e20-9fa6-47407d0e788a.doc",
+      "jxrl_url": "/data/dhu_jw/sftp/upload/course/21/010004_1909b7ab-3eed-4484-9854-c0e7f480b721.doc",
+      "timetable": {
+        "course_code": "010004",
+        "raw_html": "<tr><td style=\"text-align: center;vertical-align: inherit\">010004</td><td style=\"text-align: center;vertical-align: inherit\">集成电路器件与工艺</td><td style=\"text-align: center;vertical-align: inherit\">物理学院</td><td style=\"text-align: center;vertical-align: inherit\">288439</td><td style=\"text-align: center;vertical-align: inherit\">1</td><td style=\"text-align: center;vertical-align: inherit\">80</td><td style=\"text-align: center;vertical-align: inherit\">51</td><td style=\"text-align: center;vertical-align: inherit\">51</td><td style=\"text-align: center;vertical-align: inherit\"></td><td style=\"text-align: center;vertical-align: inherit\"><a title='查看教师信息' data-toggle='tooltip' data-placement='top' onclick='intoTeacherInfo(\"10145480\")'>吴良才</a></td><td height=\"100%\" colspan=3 align=\"center\" width=300>\n<table border=1  width=100%  cellspacing=\"0\" style=\"border-collapse: collapse\" bordercolor=\"gray\" cellpadding=\"0\"><tr><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">1-16周</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">周五.5.6.7节</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">松1138</td></tr></table></td></tr>",
+        "classes": [
+          {
+            "cttId": "288439",
+            "classNo": "1",
+            "maxCnt": 80,
+            "enrollCnt": 51,
+            "applyCnt": 51,
+            "teacher_name": "吴良才",
+            "teacher_id": "10145480",
+            "schedule_raw": "<table border=\"1\" bordercolor=\"gray\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse: collapse\" width=\"100%\"><tr><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">1-16周</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">周五.5.6.7节</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">松1138</td></tr></table>",
+            "schedule": [
+              {
+                "weeks": "1-16周",
+                "time_slot": "周五.5.6.7节",
+                "classroom": "松1138"
+              }
+            ]
+          }
+        ],
+        "class_count": 1
+      }
+    },
+    {
+      "id": "31449",
+      "kcbh": "010007",
+      "kcmc": "偏微分方程及其应用",
+      "xf": "3",
+      "orgname": "数学与统计学院",
+      "jxdg_url": "/data/dhu_jw/sftp/upload/course/01/010007dg.docx",
+      "jxrl_url": "/data/dhu_jw/sftp/upload/course/01/010007rl.docx",
+      "timetable": {
+        "course_code": "010007",
+        "raw_html": "<tr><td style=\"text-align: center;vertical-align: inherit\">010007</td><td style=\"text-align: center;vertical-align: inherit\">偏微分方程及其应用</td><td style=\"text-align: center;vertical-align: inherit\">数学与统计学院</td><td style=\"text-align: center;vertical-align: inherit\">288440</td><td style=\"text-align: center;vertical-align: inherit\">1</td><td style=\"text-align: center;vertical-align: inherit\">80</td><td style=\"text-align: center;vertical-align: inherit\">8</td><td style=\"text-align: center;vertical-align: inherit\">8</td><td style=\"text-align: center;vertical-align: inherit\">松江校区</td><td style=\"text-align: center;vertical-align: inherit\"><a title='查看教师信息' data-toggle='tooltip' data-placement='top' onclick='intoTeacherInfo(\"10145233\")'>杜玲珑</a></td><td height=\"100%\" colspan=3 align=\"center\" width=300>\n<table border=1  width=100%  cellspacing=\"0\" style=\"border-collapse: collapse\" bordercolor=\"gray\" cellpadding=\"0\"><tr><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">1-16周</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">周三.10.11.12节</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">松2105</td></tr></table></td></tr>",
+        "classes": [
+          {
+            "cttId": "288440",
+            "classNo": "1",
+            "maxCnt": 80,
+            "enrollCnt": 8,
+            "applyCnt": 8,
+            "teacher_name": "杜玲珑",
+            "teacher_id": "10145233",
+            "schedule_raw": "<table border=\"1\" bordercolor=\"gray\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse: collapse\" width=\"100%\"><tr><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">1-16周</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">周三.10.11.12节</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">松2105</td></tr></table>",
+            "schedule": [
+              {
+                "weeks": "1-16周",
+                "time_slot": "周三.10.11.12节",
+                "classroom": "松2105"
+              }
+            ]
+          }
+        ],
+        "class_count": 1
+      }
+    },
+    {
+      "id": "14719",
+      "kcbh": "010022",
+      "kcmc": "专业导论",
+      "xf": "0.5",
+      "orgname": "数学与统计学院",
+      "jxdg_url": "/data/dhu_jw/sftp/upload/course/01/010022dg.docx",
+      "jxrl_url": "/data/dhu_jw/sftp/upload/course/01/010022rl.doc",
+      "timetable": {
+        "course_code": "010022",
+        "raw_html": "<tr><td style=\"text-align: center;vertical-align: inherit\">010022</td><td style=\"text-align: center;vertical-align: inherit\">专业导论</td><td style=\"text-align: center;vertical-align: inherit\">数学与统计学院</td><td style=\"text-align: center;vertical-align: inherit\">288441</td><td style=\"text-align: center;vertical-align: inherit\">1</td><td style=\"text-align: center;vertical-align: inherit\">160</td><td style=\"text-align: center;vertical-align: inherit\">0</td><td style=\"text-align: center;vertical-align: inherit\">0</td><td style=\"text-align: center;vertical-align: inherit\"></td><td style=\"text-align: center;vertical-align: inherit\"><a title='查看教师信息' data-toggle='tooltip' data-placement='top' onclick='intoTeacherInfo(\"10145233\")'>杜玲珑</a></td><td height=\"100%\" colspan=3 align=\"center\" width=300>\n<table border=1  width=100%  cellspacing=\"0\" style=\"border-collapse: collapse\" bordercolor=\"gray\" cellpadding=\"0\"><tr><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">3-6周</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">周四.7.8节</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">松2225</td></tr></table></td></tr>",
+        "classes": [
+          {
+            "cttId": "288441",
+            "classNo": "1",
+            "maxCnt": 160,
+            "enrollCnt": 0,
+            "applyCnt": 0,
+            "teacher_name": "杜玲珑",
+            "teacher_id": "10145233",
+            "schedule_raw": "<table border=\"1\" bordercolor=\"gray\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-collapse: collapse\" width=\"100%\"><tr><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">3-6周</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">周四.7.8节</td><td style=\"text-align: center;vertical-align: inherit\" width=\"100\">松2225</td></tr></table>",
+            "schedule": [
+              {
+                "weeks": "3-6周",
+                "time_slot": "周四.7.8节",
+                "classroom": "松2225"
+              }
+            ]
+          }
+        ],
+        "class_count": 1
+      }
+    }
+  ]
+}
