@@ -21,8 +21,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer, 
 from core import (
     load_accounts, save_accounts, load_courses, save_courses,
     load_cookies_dict, save_cookies_dict, load_delete_courses, save_delete_courses,
-    get_cookies, sccourse, cancelSC, send_push_notification, 
-    query_course_info, access_judge
+    get_cookies, sccourse, cancelSC, send_push_notification,
+    query_course_info, access_judge, cleanup_thread_session
 )
 
 file_lock = QMutex()
@@ -48,75 +48,89 @@ class SingleCourseWorker(QThread):
         self.captcha_event = threading.Event()
         self.captcha_code = ""
 
+    def _wait_for_captcha(self, timeout=120):
+        """可中断的验证码等待，每 500ms 检查一次停止标志"""
+        start = time.time()
+        while time.time() - start < timeout:
+            if not self.is_running:
+                return False
+            if self.captcha_event.wait(timeout=0.5):
+                return True
+        return False
+
     def run(self):
-        self.log_signal.emit(f"🔥 线程启动: 目标课程 [{self.course_id}]")
-        while self.is_running:
-            try:
-                # 检测到需验证码时，下次请求携带 capCode=1234 绕过
-                cap = "1234" if self.use_cap_code else ""
-                self.use_cap_code = False
-                result = sccourse(self.cookies, self.course_id, cap)
-                self.retry_count += 1
-                result_str = str(result).strip()
-
-                if not result_str:
-                    self.handle_soft_ban("空响应")
-                    continue
-
+        try:
+            self.log_signal.emit(f"🔥 线程启动: 目标课程 [{self.course_id}]")
+            while self.is_running:
                 try:
-                    res_json = json.loads(result_str)
-                    if res_json.get("msg") == "F" or res_json.get("capType") == "Empty":
-                        # --- 验证码处理：弹窗请求用户输入 ---
-                        self.log_signal.emit(f"⚠️ [{self.course_id}] 需要验证码，正在请求用户输入...")
-                        self.captcha_code = ""
-                        self.captcha_event.clear()
-                        self.captcha_signal.emit()
-                        if self.captcha_event.wait(timeout=120):
-                            cap = self.captcha_code
+                    # 检测到需验证码时，下次请求携带 capCode=1234 绕过
+                    cap = "1234" if self.use_cap_code else ""
+                    self.use_cap_code = False
+                    result = sccourse(self.cookies, self.course_id, cap)
+                    self.retry_count += 1
+                    result_str = str(result).strip()
+
+                    if not result_str:
+                        self.handle_soft_ban("空响应")
+                        continue
+
+                    try:
+                        res_json = json.loads(result_str)
+                        if res_json.get("msg") == "F" or res_json.get("capType") == "Empty":
+                            # --- 验证码处理：弹窗请求用户输入 ---
+                            self.log_signal.emit(f"⚠️ [{self.course_id}] 需要验证码，正在请求用户输入...")
                             self.captcha_code = ""
-                            if cap:
-                                self.log_signal.emit(f"📝 [{self.course_id}] 已获取验证码，重新提交...")
-                                result = sccourse(self.cookies, self.course_id, cap)
-                                self.retry_count += 1
-                                result_str = str(result).strip()
-                                if result_str:
-                                    try:
-                                        res_json = json.loads(result_str)
-                                    except json.JSONDecodeError:
-                                        pass
-                                # fall through to normal result check below
+                            self.captcha_event.clear()
+                            self.captcha_signal.emit()
+                            if self._wait_for_captcha(timeout=120):
+                                cap = self.captcha_code
+                                self.captcha_code = ""
+                                if cap:
+                                    self.log_signal.emit(f"📝 [{self.course_id}] 已获取验证码，重新提交...")
+                                    result = sccourse(self.cookies, self.course_id, cap)
+                                    self.retry_count += 1
+                                    result_str = str(result).strip()
+                                    if result_str:
+                                        try:
+                                            res_json = json.loads(result_str)
+                                        except json.JSONDecodeError:
+                                            pass
+                                    # fall through to normal result check below
+                                else:
+                                    self.log_signal.emit(f"⚠️ [{self.course_id}] 验证码为空，跳过")
+                                    self.msleep(1000)
+                                    continue
                             else:
-                                self.log_signal.emit(f"⚠️ [{self.course_id}] 验证码为空，跳过")
+                                self.log_signal.emit(f"⚠️ [{self.course_id}] 验证码输入超时(120s)，继续轮询")
                                 self.msleep(1000)
                                 continue
-                        else:
-                            self.log_signal.emit(f"⚠️ [{self.course_id}] 验证码输入超时(120s)，继续轮询")
-                            self.msleep(1000)
-                            continue
-                    is_success = res_json.get("success") is True and res_json.get("msg") != "F"
-                    if not isinstance(res_json, dict):
-                        is_success = "true" in str(res_json).lower()
-                except json.JSONDecodeError:
-                    is_success = "true" in result_str and "Empty" not in result_str and "F" not in result_str
+                        is_success = res_json.get("success") is True and res_json.get("msg") != "F"
+                        if not isinstance(res_json, dict):
+                            is_success = "true" in str(res_json).lower()
+                    except json.JSONDecodeError:
+                        is_success = "true" in result_str and "Empty" not in result_str and "F" not in result_str
 
-                if is_success:
-                    self.handle_success()
-                    break 
-                elif "Full" in result_str or "满" in result_str:
-                    if self.retry_count % 10 == 0:
-                        self.log_signal.emit(f"⏳ [{self.course_id}] 人数已满..., 尝试 (第{self.retry_count}次)")
-                elif "TIMEOUT" in result_str:
-                    self.log_signal.emit(f"⚠️ [{self.course_id}] 请求超时")
-                else:
-                    if self.retry_count % 5 == 0:
-                        self.log_signal.emit(f"📝 [{self.course_id}] 结果: {result_str[:60]}...")
-            except Exception as e:
-                self.log_signal.emit(f"❌ [{self.course_id}] 线程异常: {e}")
-            
-            if self.interval > 0:
-                jitter = random.uniform(0, self.interval * 0.6)
-                self.msleep(int((self.interval + jitter) * 1000))
-        self.finished_signal.emit(self.course_id)
+                    if is_success:
+                        self.handle_success()
+                        break
+                    elif "Full" in result_str or "满" in result_str:
+                        if self.retry_count % 10 == 0:
+                            self.log_signal.emit(f"⏳ [{self.course_id}] 人数已满..., 尝试 (第{self.retry_count}次)")
+                    elif "TIMEOUT" in result_str:
+                        self.log_signal.emit(f"⚠️ [{self.course_id}] 请求超时")
+                    else:
+                        if self.retry_count % 5 == 0:
+                            self.log_signal.emit(f"📝 [{self.course_id}] 结果: {result_str[:60]}...")
+                except Exception as e:
+                    self.log_signal.emit(f"❌ [{self.course_id}] 线程异常: {e}")
+
+                if self.interval > 0:
+                    jitter = random.uniform(0, self.interval * 0.6)
+                    self.msleep(int((self.interval + jitter) * 1000))
+            self.finished_signal.emit(self.course_id)
+        finally:
+            # 释放线程本地的 HTTP 连接池
+            cleanup_thread_session()
 
     def handle_soft_ban(self, reason):
         self.empty_count += 1
@@ -172,115 +186,129 @@ class PickUpWorker(QThread):
         self.captcha_event = threading.Event()
         self.captcha_code = ""
 
+    def _wait_for_captcha(self, timeout=120):
+        """可中断的验证码等待，每 500ms 检查一次停止标志"""
+        start = time.time()
+        while time.time() - start < timeout:
+            if not self.is_running:
+                return False
+            if self.captcha_event.wait(timeout=0.5):
+                return True
+        return False
+
     def run(self):
-        self.log_signal.emit(f"🕵️‍♂️ 捡漏模式启动: 监控课程代码 [{self.course_code}]")
-        self.log_signal.emit(f"🎯 包含目标班级(cttId): {self.target_ctt_ids}")
-        
-        while self.is_running:
-            try:
-                # === 步骤 1: 权限检查 (accessJudge) ===
-                # 每次循环都执行，完全模拟点击行为
-                # self.log_signal.emit("Checking access...") # 日志太多可注释
-                judge_res = access_judge(self.cookies, self.course_code)
-                
-                # 如果鉴权失败（比如被登出、风控、或返回 false），则不进行下一步查询
-                if '"success":true' not in str(judge_res):
-                    self.log_signal.emit(f"⚠️ 权限检查未通过: {str(judge_res)}... (可能已失效或被拦截)")
-                    self.msleep(5000) # 冷却一下
-                    continue 
+        try:
+            self.log_signal.emit(f"🕵️‍♂️ 捡漏模式启动: 监控课程代码 [{self.course_code}]")
+            self.log_signal.emit(f"🎯 包含目标班级(cttId): {self.target_ctt_ids}")
 
-                # === 模拟人类操作的微小延迟 ===
-                # 浏览器发完 accessJudge 后加载 initACC 肯定有几十毫秒的间隔
-                self.msleep(random.randint(200, 500))
-
-                # === 步骤 2: 获取列表 (initACC) ===
-                res_str = query_course_info(self.cookies, self.course_code)
-                self.check_count += 1
-                
-                # 解析数据
+            while self.is_running:
                 try:
-                    data = json.loads(res_str)
-                    if not data.get("success"):
-                         self.log_signal.emit(f"⚠️ 查询失败: {data.get('msg', '未知错误')}")
-                    else:
-                        class_list = data.get("aaData", [])
-                        found_target = False
-                        
-                        for cls in class_list:
-                            ctt_id = str(cls.get("cttId"))
-                            
-                            if ctt_id in self.target_ctt_ids:
-                                found_target = True
-                                max_cnt = int(cls.get("maxCnt", 0))
-                                enroll_cnt = int(cls.get("enrollCnt", 0))
-                                class_no = cls.get("classNo", "?")
-                                course_name = cls.get("crName", "未知课程")
-                                
-                                remaining = max_cnt - enroll_cnt
-                                
-                                # === 步骤 3: 发现空位 -> 抢课 ===
-                                if remaining > 0:
-                                    self.log_signal.emit(f"⚡ 发现空位！[{course_name}] 班级[{class_no}] 余量: {remaining}")
-                                    self.log_signal.emit(f"🚀 立即发起抢课请求 -> {ctt_id}")
+                    # === 步骤 1: 权限检查 (accessJudge) ===
+                    # 每次循环都执行，完全模拟点击行为
+                    # self.log_signal.emit("Checking access...") # 日志太多可注释
+                    judge_res = access_judge(self.cookies, self.course_code)
 
-                                    cap = "1234" if self.use_cap_code else ""
-                                    self.use_cap_code = False
-                                    sc_res = sccourse(self.cookies, ctt_id, cap)
+                    # 如果鉴权失败（比如被登出、风控、或返回 false），则不进行下一步查询
+                    if '"success":true' not in str(judge_res):
+                        self.log_signal.emit(f"⚠️ 权限检查未通过: {str(judge_res)}... (可能已失效或被拦截)")
+                        self.msleep(5000) # 冷却一下
+                        continue
 
-                                    # 检测是否需要验证码
-                                    try:
-                                        sc_json = json.loads(sc_res)
-                                        if sc_json.get("msg") == "F":
-                                            # --- 验证码处理：弹窗请求用户输入 ---
-                                            self.log_signal.emit("⚠️ 抢课遇到验证码，正在请求用户输入...")
-                                            self.captcha_code = ""
-                                            self.captcha_event.clear()
-                                            self.captcha_signal.emit()
-                                            if self.captcha_event.wait(timeout=120):
-                                                real_cap = self.captcha_code
+                    # === 模拟人类操作的微小延迟 ===
+                    # 浏览器发完 accessJudge 后加载 initACC 肯定有几十毫秒的间隔
+                    self.msleep(random.randint(200, 500))
+
+                    # === 步骤 2: 获取列表 (initACC) ===
+                    res_str = query_course_info(self.cookies, self.course_code)
+                    self.check_count += 1
+
+                    # 解析数据
+                    try:
+                        data = json.loads(res_str)
+                        if not data.get("success"):
+                             self.log_signal.emit(f"⚠️ 查询失败: {data.get('msg', '未知错误')}")
+                        else:
+                            class_list = data.get("aaData", [])
+                            found_target = False
+
+                            for cls in class_list:
+                                ctt_id = str(cls.get("cttId"))
+
+                                if ctt_id in self.target_ctt_ids:
+                                    found_target = True
+                                    max_cnt = int(cls.get("maxCnt", 0))
+                                    enroll_cnt = int(cls.get("enrollCnt", 0))
+                                    class_no = cls.get("classNo", "?")
+                                    course_name = cls.get("crName", "未知课程")
+
+                                    remaining = max_cnt - enroll_cnt
+
+                                    # === 步骤 3: 发现空位 -> 抢课 ===
+                                    if remaining > 0:
+                                        self.log_signal.emit(f"⚡ 发现空位！[{course_name}] 班级[{class_no}] 余量: {remaining}")
+                                        self.log_signal.emit(f"🚀 立即发起抢课请求 -> {ctt_id}")
+
+                                        cap = "1234" if self.use_cap_code else ""
+                                        self.use_cap_code = False
+                                        sc_res = sccourse(self.cookies, ctt_id, cap)
+
+                                        # 检测是否需要验证码
+                                        try:
+                                            sc_json = json.loads(sc_res)
+                                            if sc_json.get("msg") == "F":
+                                                # --- 验证码处理：弹窗请求用户输入 ---
+                                                self.log_signal.emit("⚠️ 抢课遇到验证码，正在请求用户输入...")
                                                 self.captcha_code = ""
-                                                if real_cap:
-                                                    self.log_signal.emit(f"📝 已获取验证码，重新提交...")
-                                                    sc_res = sccourse(self.cookies, ctt_id, real_cap)
-                                                    # fall through to result check below
+                                                self.captcha_event.clear()
+                                                self.captcha_signal.emit()
+                                                if self._wait_for_captcha(timeout=120):
+                                                    real_cap = self.captcha_code
+                                                    self.captcha_code = ""
+                                                    if real_cap:
+                                                        self.log_signal.emit(f"📝 已获取验证码，重新提交...")
+                                                        sc_res = sccourse(self.cookies, ctt_id, real_cap)
+                                                        # fall through to result check below
+                                                    else:
+                                                        self.log_signal.emit("⚠️ 验证码为空，跳过")
+                                                        self.msleep(1000)
+                                                        continue
                                                 else:
-                                                    self.log_signal.emit("⚠️ 验证码为空，跳过")
+                                                    self.log_signal.emit("⚠️ 验证码输入超时(120s)，继续监控")
                                                     self.msleep(1000)
                                                     continue
-                                            else:
-                                                self.log_signal.emit("⚠️ 验证码输入超时(120s)，继续监控")
-                                                self.msleep(1000)
-                                                continue
-                                    except:
-                                        pass
+                                        except:
+                                            pass
 
-                                    if "true" in str(sc_res) or "成功" in str(sc_res):
-                                        self.handle_success(ctt_id, class_no, course_name)
+                                        if "true" in str(sc_res) or "成功" in str(sc_res):
+                                            self.handle_success(ctt_id, class_no, course_name)
+                                        else:
+                                            self.log_signal.emit(f"❌ 抢课失败: {sc_res}")
                                     else:
-                                        self.log_signal.emit(f"❌ 抢课失败: {sc_res}")
-                                else:
-                                    if self.check_count % 20 == 0:
-                                        self.log_signal.emit(f"👀 ({self.check_count})监控中... [{course_name}][{class_no}] 满员 ({enroll_cnt}/{max_cnt})")
+                                        if self.check_count % 20 == 0:
+                                            self.log_signal.emit(f"👀 ({self.check_count})监控中... [{course_name}][{class_no}] 满员 ({enroll_cnt}/{max_cnt})")
 
-                        if not found_target and self.check_count % 10 == 0:
-                             self.log_signal.emit(f"⚠️ 警告: 未找到目标ID。请确认CourseCode {self.course_code} 正确。")
+                            if not found_target and self.check_count % 10 == 0:
+                                 self.log_signal.emit(f"⚠️ 警告: 未找到目标ID。请确认CourseCode {self.course_code} 正确。")
 
-                except json.JSONDecodeError:
-                    if not res_str:
-                         self.log_signal.emit("⚠️ 查询返回为空 (可能被限流)，冷却中...")
-                         self.msleep(5000)
-                    else:
-                         self.log_signal.emit(f"⚠️ 解析JSON失败")
+                    except json.JSONDecodeError:
+                        if not res_str:
+                             self.log_signal.emit("⚠️ 查询返回为空 (可能被限流)，冷却中...")
+                             self.msleep(5000)
+                        else:
+                             self.log_signal.emit(f"⚠️ 解析JSON失败")
 
-            except Exception as e:
-                self.log_signal.emit(f"❌ 捡漏线程异常: {e}")
-            
-            # 循环间隔 (包含随机抖动)
-            if self.interval > 0:
-                jitter = random.uniform(0, self.interval * 0.5)
-                self.msleep(int((self.interval + jitter) * 1000))
-        
-        self.log_signal.emit(f"⏹️ 捡漏监控停止: {self.course_code}")
+                except Exception as e:
+                    self.log_signal.emit(f"❌ 捡漏线程异常: {e}")
+
+                # 循环间隔 (包含随机抖动)
+                if self.interval > 0:
+                    jitter = random.uniform(0, self.interval * 0.5)
+                    self.msleep(int((self.interval + jitter) * 1000))
+
+            self.log_signal.emit(f"⏹️ 捡漏监控停止: {self.course_code}")
+        finally:
+            # 释放线程本地的 HTTP 连接池
+            cleanup_thread_session()
 
     def handle_success(self, ctt_id, class_no, course_name):
         msg = f"🎉 捡漏成功！{course_name} (班级:{class_no})"
@@ -342,6 +370,16 @@ class UpgradeWorker(QThread):
         self.captcha_code = ""
         self._course_data = None  # 缓存 courses_full.json
 
+    def _wait_for_captcha(self, timeout=120):
+        """可中断的验证码等待，每 500ms 检查一次停止标志"""
+        start = time.time()
+        while time.time() - start < timeout:
+            if not self.is_running:
+                return False
+            if self.captcha_event.wait(timeout=0.5):
+                return True
+        return False
+
     def _load_course_data(self):
         """加载 courses_full.json 并缓存"""
         if self._course_data is not None:
@@ -375,137 +413,141 @@ class UpgradeWorker(QThread):
         return None
 
     def run(self):
-        # ── 1. 查找信息 ──
-        current_info = self._lookup_kcbh(self.current_ctt_id)
-        target_info = self._lookup_kcbh(self.target_ctt_id)
+        try:
+            # ── 1. 查找信息 ──
+            current_info = self._lookup_kcbh(self.current_ctt_id)
+            target_info = self._lookup_kcbh(self.target_ctt_id)
 
-        if not target_info:
-            self.log_signal.emit(f"❌ 未在 courses_full.json 中找到目标课程 (cttId={self.target_ctt_id})")
-            self.finished_signal.emit()
-            return
+            if not target_info:
+                self.log_signal.emit(f"❌ 未在 courses_full.json 中找到目标课程 (cttId={self.target_ctt_id})")
+                self.finished_signal.emit()
+                return
 
-        current_name = current_info["kcmc"] if current_info else self.current_ctt_id
-        target_name = target_info["kcmc"]
-        target_kcbh = target_info["kcbh"]
+            current_name = current_info["kcmc"] if current_info else self.current_ctt_id
+            target_name = target_info["kcmc"]
+            target_kcbh = target_info["kcbh"]
 
-        self.log_signal.emit(f"🆙 升级线程启动: [{current_name}] → [{target_name}]")
-        if current_info:
-            self.log_signal.emit(f"  当前: {current_info['kcbh']} 班序{current_info['classNo']} "
-                                 f"({current_info['enrollCnt']}/{current_info['maxCnt']})")
-        self.log_signal.emit(f"  目标: {target_kcbh} ({target_info['enrollCnt']}/{target_info['maxCnt']})")
-        self.log_signal.emit("⏳ 等待目标课程出现空位...")
+            self.log_signal.emit(f"🆙 升级线程启动: [{current_name}] → [{target_name}]")
+            if current_info:
+                self.log_signal.emit(f"  当前: {current_info['kcbh']} 班序{current_info['classNo']} "
+                                     f"({current_info['enrollCnt']}/{current_info['maxCnt']})")
+            self.log_signal.emit(f"  目标: {target_kcbh} ({target_info['enrollCnt']}/{target_info['maxCnt']})")
+            self.log_signal.emit("⏳ 等待目标课程出现空位...")
 
-        while self.is_running:
-            try:
-                # ── 直接查询班级列表（不用 accessJudge，已选课程会使它失败）──
-                self.msleep(random.randint(200, 500))
-                res_str = query_course_info(self.cookies, target_kcbh)
-                self.check_count += 1
-
+            while self.is_running:
                 try:
-                    data = json.loads(res_str)
-                except json.JSONDecodeError:
-                    if not res_str and self.check_count % 5 == 0:
-                        self.log_signal.emit("⚠️ 查询返回为空，可能被限流")
-                    self.msleep(5000)
-                    continue
+                    # ── 直接查询班级列表（不用 accessJudge，已选课程会使它失败）──
+                    self.msleep(random.randint(200, 500))
+                    res_str = query_course_info(self.cookies, target_kcbh)
+                    self.check_count += 1
 
-                if not data.get("success"):
-                    if self.check_count % 5 == 0:
-                        self.log_signal.emit(f"⚠️ 查询失败: {data.get('msg', '未知')}")
-                    self.msleep(3000)
-                    continue
+                    try:
+                        data = json.loads(res_str)
+                    except json.JSONDecodeError:
+                        if not res_str and self.check_count % 5 == 0:
+                            self.log_signal.emit("⚠️ 查询返回为空，可能被限流")
+                        self.msleep(5000)
+                        continue
 
-                # ── 查找目标班级 ──
-                found_vacancy = False
-                for cls in data.get("aaData", []):
-                    if str(cls.get("cttId")) == self.target_ctt_id:
-                        enroll = int(cls.get("enrollCnt", 0))
-                        max_cnt = int(cls.get("maxCnt", 0))
-                        remaining = max_cnt - enroll
+                    if not data.get("success"):
+                        if self.check_count % 5 == 0:
+                            self.log_signal.emit(f"⚠️ 查询失败: {data.get('msg', '未知')}")
+                        self.msleep(3000)
+                        continue
 
-                        if remaining > 0:
-                            found_vacancy = True
-                            class_no = cls.get("classNo", "?")
-                            self.log_signal.emit(f"⚡ 发现空位！[{target_name}] 班级[{class_no}] "
-                                                 f"余量: {remaining}/{max_cnt}")
+                    # ── 查找目标班级 ──
+                    found_vacancy = False
+                    for cls in data.get("aaData", []):
+                        if str(cls.get("cttId")) == self.target_ctt_id:
+                            enroll = int(cls.get("enrollCnt", 0))
+                            max_cnt = int(cls.get("maxCnt", 0))
+                            remaining = max_cnt - enroll
 
-                            # ── 步骤 A: 退掉当前课程 ──
-                            if current_info:
-                                cancel_res = cancelSC(self.cookies,
-                                                      current_info["kcbh"],
-                                                      current_info["classNo"])
-                                self.log_signal.emit(f"📝 退课结果: {cancel_res}")
-                                # 简单判断退课是否成功
-                                if '"success":true' not in str(cancel_res) and "成功" not in str(cancel_res):
-                                    self.log_signal.emit("⚠️ 退课可能失败，仍尝试选课...")
+                            if remaining > 0:
+                                found_vacancy = True
+                                class_no = cls.get("classNo", "?")
+                                self.log_signal.emit(f"⚡ 发现空位！[{target_name}] 班级[{class_no}] "
+                                                     f"余量: {remaining}/{max_cnt}")
 
-                            # ── 步骤 B: 选择目标课程 ──
-                            self.log_signal.emit(f"🚀 发起选课请求 -> {self.target_ctt_id}")
-                            cap = "1234" if self.use_cap_code else ""
-                            self.use_cap_code = False
-                            sc_res = sccourse(self.cookies, self.target_ctt_id, cap)
+                                # ── 步骤 A: 退掉当前课程 ──
+                                if current_info:
+                                    cancel_res = cancelSC(self.cookies,
+                                                          current_info["kcbh"],
+                                                          current_info["classNo"])
+                                    self.log_signal.emit(f"📝 退课结果: {cancel_res}")
+                                    # 简单判断退课是否成功
+                                    if '"success":true' not in str(cancel_res) and "成功" not in str(cancel_res):
+                                        self.log_signal.emit("⚠️ 退课可能失败，仍尝试选课...")
 
-                            # 检测是否需要验证码
-                            try:
-                                sc_json = json.loads(sc_res)
-                                if sc_json.get("msg") == "F":
-                                    # --- 验证码处理：弹窗请求用户输入 ---
-                                    self.log_signal.emit("⚠️ 选课遇到验证码，正在请求用户输入...")
-                                    self.captcha_code = ""
-                                    self.captcha_event.clear()
-                                    self.captcha_signal.emit()
-                                    if self.captcha_event.wait(timeout=120):
-                                        real_cap = self.captcha_code
+                                # ── 步骤 B: 选择目标课程 ──
+                                self.log_signal.emit(f"🚀 发起选课请求 -> {self.target_ctt_id}")
+                                cap = "1234" if self.use_cap_code else ""
+                                self.use_cap_code = False
+                                sc_res = sccourse(self.cookies, self.target_ctt_id, cap)
+
+                                # 检测是否需要验证码
+                                try:
+                                    sc_json = json.loads(sc_res)
+                                    if sc_json.get("msg") == "F":
+                                        # --- 验证码处理：弹窗请求用户输入 ---
+                                        self.log_signal.emit("⚠️ 选课遇到验证码，正在请求用户输入...")
                                         self.captcha_code = ""
-                                        if real_cap:
-                                            self.log_signal.emit(f"📝 已获取验证码，重新提交...")
-                                            sc_res = sccourse(self.cookies, self.target_ctt_id, real_cap)
-                                            # fall through to result check below
+                                        self.captcha_event.clear()
+                                        self.captcha_signal.emit()
+                                        if self._wait_for_captcha(timeout=120):
+                                            real_cap = self.captcha_code
+                                            self.captcha_code = ""
+                                            if real_cap:
+                                                self.log_signal.emit(f"📝 已获取验证码，重新提交...")
+                                                sc_res = sccourse(self.cookies, self.target_ctt_id, real_cap)
+                                                # fall through to result check below
+                                            else:
+                                                self.log_signal.emit("⚠️ 验证码为空，跳过")
+                                                self.msleep(1000)
+                                                continue
                                         else:
-                                            self.log_signal.emit("⚠️ 验证码为空，跳过")
+                                            self.log_signal.emit("⚠️ 验证码输入超时(120s)，继续监控")
                                             self.msleep(1000)
                                             continue
-                                    else:
-                                        self.log_signal.emit("⚠️ 验证码输入超时(120s)，继续监控")
-                                        self.msleep(1000)
-                                        continue
-                            except:
-                                pass
+                                except:
+                                    pass
 
-                            if "true" in str(sc_res) or "成功" in str(sc_res):
-                                msg = f"🎉 升级成功！{current_name} → {target_name}"
-                                self.log_signal.emit(msg)
-                                self.success_signal.emit(f"{self.current_ctt_id}→{self.target_ctt_id}")
-                                if self.push_token:
-                                    send_push_notification(self.push_token, "🆙 升级课程成功", msg)
-                                self.is_running = False
-                                self.finished_signal.emit()
-                                return
+                                if "true" in str(sc_res) or "成功" in str(sc_res):
+                                    msg = f"🎉 升级成功！{current_name} → {target_name}"
+                                    self.log_signal.emit(msg)
+                                    self.success_signal.emit(f"{self.current_ctt_id}→{self.target_ctt_id}")
+                                    if self.push_token:
+                                        send_push_notification(self.push_token, "🆙 升级课程成功", msg)
+                                    self.is_running = False
+                                    self.finished_signal.emit()
+                                    return
+                                else:
+                                    self.log_signal.emit(f"❌ 选课失败: {sc_res}")
+                                    self.log_signal.emit("💡 目标可能已被抢走，继续等待新空位...")
+
                             else:
-                                self.log_signal.emit(f"❌ 选课失败: {sc_res}")
-                                self.log_signal.emit("💡 目标可能已被抢走，继续等待新空位...")
+                                if self.check_count % 15 == 0:
+                                    self.log_signal.emit(f"👀 ({self.check_count}) 监控中... "
+                                                         f"[{target_name}] 满员 ({enroll}/{max_cnt})")
 
-                        else:
-                            if self.check_count % 15 == 0:
-                                self.log_signal.emit(f"👀 ({self.check_count}) 监控中... "
-                                                     f"[{target_name}] 满员 ({enroll}/{max_cnt})")
+                    if not found_vacancy and self.check_count % 10 == 0:
+                        self.log_signal.emit(f"👀 ({self.check_count}) 目标课程无空位，继续监控...")
 
-                if not found_vacancy and self.check_count % 10 == 0:
-                    self.log_signal.emit(f"👀 ({self.check_count}) 目标课程无空位，继续监控...")
+                except Exception as e:
+                    self.log_signal.emit(f"❌ 升级线程异常: {e}")
+                    import traceback
+                    self.log_signal.emit(traceback.format_exc())
 
-            except Exception as e:
-                self.log_signal.emit(f"❌ 升级线程异常: {e}")
-                import traceback
-                self.log_signal.emit(traceback.format_exc())
+                # 循环间隔 + 随机抖动
+                if self.interval > 0 and self.is_running:
+                    jitter = random.uniform(0, self.interval * 0.5)
+                    self.msleep(int((self.interval + jitter) * 1000))
 
-            # 循环间隔 + 随机抖动
-            if self.interval > 0 and self.is_running:
-                jitter = random.uniform(0, self.interval * 0.5)
-                self.msleep(int((self.interval + jitter) * 1000))
-
-        self.log_signal.emit("⏹️ 升级监控已停止")
-        self.finished_signal.emit()
+            self.log_signal.emit("⏹️ 升级监控已停止")
+            self.finished_signal.emit()
+        finally:
+            # 释放线程本地的 HTTP 连接池
+            cleanup_thread_session()
 
     def stop(self):
         self.is_running = False
@@ -1155,11 +1197,11 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.pre_work_thread = None
         self.is_running = False
         self.request_interval = 1.0
-        self.dark_mode = True 
-        
-        self.scheduled_time = None 
-        self.browser_type = "edge" 
-        self.push_token = "" 
+        self.dark_mode = True
+
+        self.scheduled_time = None
+        self.scheduled_triggered = False
+        self.push_token = ""
         
         self.load_settings()
 
@@ -1214,7 +1256,6 @@ class ProductionGlassmorphismUI(QMainWindow):
 
         settings_menu.addAction("并发/查询间隔").triggered.connect(self.set_request_interval)
         settings_menu.addAction("设置定时启动").triggered.connect(self.set_schedule_dialog)
-        settings_menu.addAction("切换浏览器引擎").triggered.connect(self.select_browser_dialog)
         settings_menu.addAction("配置微信推送").triggered.connect(self.set_push_token_dialog)
         settings_menu.addSeparator()
         self.theme_action = settings_menu.addAction("🌙 切换为浅色模式")
@@ -1439,7 +1480,6 @@ class ProductionGlassmorphismUI(QMainWindow):
                 self.user_combo.addItem(acc["name"])
             self.user_combo.blockSignals(False)
             self.log_display.append("✓ 系统就绪")
-            self.log_display.append(f"✓ 当前浏览器引擎: {self.browser_type.upper()}")
         except: pass
 
     def on_user_changed(self, username):
@@ -1517,33 +1557,42 @@ class ProductionGlassmorphismUI(QMainWindow):
             except: pass
     
     def check_schedule(self):
-        if self.scheduled_time and not self.is_running:
-            current_time = QTime.currentTime().toString("HH:mm:ss")
-            if current_time == self.scheduled_time:
-                self.log_display.append(f"⏰ 触发定时任务: {current_time}")
+        if self.scheduled_time and not self.is_running and not self.scheduled_triggered:
+            target = QTime.fromString(self.scheduled_time, "HH:mm:ss")
+            if not target.isValid():
+                return
+            current = QTime.currentTime()
+            # ±1 秒容差窗口，避免主线程阻塞错过精确时间点
+            diff_seconds = abs(current.secsTo(target))
+            if diff_seconds <= 1:
+                self.scheduled_triggered = True
+                current_str = current.toString("HH:mm:ss")
+                self.log_display.append(f"⏰ 触发定时任务: {current_str} (目标: {self.scheduled_time})")
                 self.toggle_selection()
-                self.scheduled_time = None 
+                self.scheduled_time = None
                 self.title_label.setText(f"⚡ 智能抢课系统 Pro (并发版)")
 
     def set_schedule_dialog(self):
         time_str, ok = self._get_text_input("定时启动", "输入启动时间 (HH:mm:ss):")
         if ok and time_str:
-            if len(time_str.split(':')) == 3:
-                self.scheduled_time = time_str
-                self.log_display.append(f"⏰ 定时已设置: {self.scheduled_time}")
-                self.title_label.setText(f"⚡ 智能抢课系统 Pro (定时: {self.scheduled_time})")
+            time_str = time_str.strip()
+            # 解析并规范化时间格式，同时验证有效性
+            parts = time_str.split(':')
+            if len(parts) == 3:
+                try:
+                    h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                    normalized = QTime(h, m, s)
+                    if normalized.isValid():
+                        self.scheduled_time = normalized.toString("HH:mm:ss")
+                        self.scheduled_triggered = False
+                        self.log_display.append(f"⏰ 定时已设置: {self.scheduled_time}")
+                        self.title_label.setText(f"⚡ 智能抢课系统 Pro (定时: {self.scheduled_time})")
+                    else:
+                        QMessageBox.warning(self, "格式错误", "时间无效，请使用正确的 HH:mm:ss 格式，例如 12:59:59")
+                except ValueError:
+                    QMessageBox.warning(self, "格式错误", "请使用正确的 HH:mm:ss 格式，例如 12:59:59")
             else:
                 QMessageBox.warning(self, "格式错误", "请使用 HH:mm:ss 格式，例如 12:59:59")
-
-    def select_browser_dialog(self):
-        items = ["System Edge (默认)", "Chrome Portable/System"]
-        item, ok = QInputDialog.getItem(self, "选择浏览器", "请选择登录用的浏览器引擎:", items, 0, False)
-        if ok and item:
-            if "Chrome" in item:
-                self.browser_type = "chrome"
-            else:
-                self.browser_type = "edge"
-            self.log_display.append(f"🔧 浏览器引擎已切换为: {self.browser_type.upper()}")
 
     def set_push_token_dialog(self):
         token, ok = self._get_text_input("微信推送配置", "请输入 PushPlus Token (留空则关闭):")
@@ -1573,8 +1622,7 @@ class ProductionGlassmorphismUI(QMainWindow):
             QMessageBox.information(self, "提示", "未选择任何账号")
             return
 
-        browser_name = "Edge" if self.browser_type == "edge" else "Chrome"
-        self.log_display.append(f"--- 开始批量获取 Cookie (引擎: {browser_name}) ---")
+        self.log_display.append(f"--- 开始批量获取 Cookie (CAS HTTP+RSA) ---")
         self.log_display.append(f"📋 共 {len(selected)} 个账号需要更新")
 
         success_count = 0
@@ -1588,23 +1636,10 @@ class ProductionGlassmorphismUI(QMainWindow):
 
             self.log_display.append(f"\n[{i}/{len(selected)}] 正在处理: {name} ({uid})")
 
-            # 每个账号启动前都确认一次（浏览器弹窗需要人工交互）
-            reply = QMessageBox.question(
-                self, f"准备就绪 — {name}",
-                f"即将使用 [{browser_name}] 为 [{name}] 获取 Cookie。\n"
-                f"请确保浏览器可用，并手动完成验证码（如有）。\n\n"
-                f"进度: {i}/{len(selected)}",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                self.log_display.append(f"⏭️ 已跳过: {name}")
-                continue
-
             try:
                 cookies_list = get_cookies(
                     uid, pwd,
                     report_callback=self.log_display.append,
-                    browser_type=self.browser_type
                 )
                 if cookies_list:
                     cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
@@ -1686,30 +1721,27 @@ class ProductionGlassmorphismUI(QMainWindow):
     def stop_selection(self):
         self.is_running = False
         self.log_display.append("⏹️ 正在停止所有线程...")
-        
-        # 1. 停止普通并发线程
+
+        # 1. 停止普通并发线程（非阻塞停止，验证码等待会自动中断）
         if self.pre_work_thread and self.pre_work_thread.isRunning():
-            self.pre_work_thread.terminate() 
+            self.pre_work_thread.terminate()
         for w in self.workers:
             if w.isRunning():
                 w.stop()
-                w.wait() 
         self.workers.clear()
-        
+
         # 2. 停止捡漏线程
         for w in self.pickup_workers:
             if w.isRunning():
                 w.stop()
-                w.wait()
         self.pickup_workers.clear()
 
         # 2.5 停止升级线程
         for w in self.upgrade_workers:
             if w.isRunning():
                 w.stop()
-                w.wait()
         self.upgrade_workers.clear()
-        
+
         # 3. 复位按钮和样式
         self.start_stop_button.setText("🚀 开始并发选课")
         self.apply_glassmorphism_style()
