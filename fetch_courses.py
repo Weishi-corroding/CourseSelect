@@ -22,6 +22,10 @@ import time
 import subprocess
 import argparse
 import re
+import threading
+
+import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 # 复用 core 模块的路径 / 文件常量
@@ -31,6 +35,85 @@ FILES = {
     "cookies": "cookies.json",
 }
 LOG_FILE = "CoureseSelectDebug.log"
+
+
+class SessionExpired(Exception):
+    """Cookie 已失效：服务器把请求重定向到了 CAS 登录页 (/dhu/caslogin)。"""
+    pass
+
+
+def _check_session_expired(resp):
+    """若 curl 响应体疑似为 CAS 登录跳转，抛 SessionExpired。
+
+    教务系统在 Cookie 失效时通常返回 302→/dhu/caslogin 或者直接返回一段
+    内嵌 meta-refresh / JS 跳转到 /dhu/caslogin 的 HTML。curl 不跟 -L
+    时这段内容会直接进 stdout。
+    """
+    if not resp:
+        return
+    low = resp.lower()
+    if "caslogin" in low or "/dhu/caslogin" in resp:
+        raise SessionExpired("cookie expired - response redirected to /dhu/caslogin")
+
+
+# ── HTTP 连接池（requests.Session，replace curl subprocess on the hot path）─
+# 与 core._get_session 同样采用 thread-local 模式：每个调用线程持有自己的
+# Session，HTTPAdapter 给同主机维持 keep-alive。fetch_course_timetable 在
+# 全量抓取时循环上千次，复用单个 TLS 连接能省掉每次的握手开销。
+
+_STATIC_HEADERS = {
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+    "Connection": "keep-alive",
+    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+    "Origin": "https://jwgl.dhu.edu.cn",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+    "X-Requested-With": "XMLHttpRequest",
+    "sec-ch-ua": '"Microsoft Edge";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+_thread_local = threading.local()
+
+
+def _get_session():
+    """返回线程本地的 requests.Session（keep-alive 连接池 + 预置请求头）"""
+    try:
+        return _thread_local.session
+    except AttributeError:
+        s = requests.Session()
+        s.headers.update(_STATIC_HEADERS)
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _thread_local.session = s
+        return s
+
+
+def _http_post(url, body, cookies, *, timeout=35, referer=None):
+    """POST 包装：通过线程本地 Session 发送，复用 keep-alive。
+
+    Cookie 仅通过 header 注入（与原 curl `-H "Cookie: ..."` 行为一致），
+    不传 cookies= 参数，避免 requests 把字符串误解析成 cookie jar。
+    返回响应体字符串；超时/异常返回 ""（与 _run_curl 同语义）。
+    """
+    headers = {"Cookie": cookies}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        resp = _get_session().post(url, data=body, headers=headers, timeout=timeout)
+        return resp.text or ""
+    except requests.Timeout:
+        log("⚠️ HTTP 超时")
+        return ""
+    except Exception as e:
+        log(f"⚠️ HTTP 异常: {e}")
+        return ""
+
 
 
 # ── 日志 ──────────────────────────────────────────────────────────
@@ -124,13 +207,9 @@ def _common_headers(cookies):
 
 
 # ── API 1: 获取学期开课总列表 ─────────────────────────────────────
-def fetch_course_list(cookies, term_id=88, display_length=1876):
-    """
-    调用 getSelectCourseTermList 获取学期全部课程基本信息。
-    返回 aaData 列表 (list[dict])。
-    """
-    url = "https://jwgl.dhu.edu.cn/dhu/PublicQuery/getSelectCourseTermList"
-    post_data = (
+def _build_course_list_body(term_id, display_length):
+    """构造 getSelectCourseTermList 的 DataTables POST body"""
+    return (
         "sEcho=1&iColumns=6&sColumns="
         "&iDisplayStart=0"
         f"&iDisplayLength={display_length}"
@@ -142,14 +221,68 @@ def fetch_course_list(cookies, term_id=88, display_length=1876):
         f"&termId={term_id}&course="
     )
 
-    cmd = ["curl", url, "--compressed", "-s", "--max-time", "30"] + _common_headers(cookies) + ["--data-raw", post_data]
+
+def fetch_course_list(cookies, term_id=88, display_length=None):
+    """
+    调用 getSelectCourseTermList 获取学期全部课程基本信息。
+    返回 aaData 列表 (list[dict])。
+
+    display_length:
+        None (默认) → 先做一次 iDisplayLength=1 的探测调用拿到
+                      iTotalRecords/iTotalDisplayRecords，再用真实总数
+                      二次拉取，保证不会因为硬编码上限漏课。
+        显式整数    → 直接按该值拉取（旧行为，CLI 测试可用 --limit 简化）。
+    """
+    url = "https://jwgl.dhu.edu.cn/dhu/PublicQuery/getSelectCourseTermList"
 
     log(f"📡 正在获取学期开课列表 (termId={term_id})...")
-    resp = _run_curl(cmd, timeout=35)
+
+    # 自动发现总课程数
+    if display_length is None:
+        probe = _http_post(
+            url, _build_course_list_body(term_id, 1), cookies, timeout=20,
+            referer="https://jwgl.dhu.edu.cn/dhu/PublicQuery/toPage",
+        )
+        if not probe:
+            log("❌ 探测调用未获取到响应")
+            return []
+        _check_session_expired(probe)
+        try:
+            probe_data = json.loads(probe)
+        except json.JSONDecodeError:
+            log(f"❌ 探测调用 JSON 解析失败，前 200 字符: {probe[:200]}")
+            return []
+        if not probe_data.get("success"):
+            log(f"⚠️ 探测调用失败: {probe_data.get('msg', '未知错误')}")
+            return []
+        # DataTables 协议返回 iTotalRecords / iTotalDisplayRecords，本系统两者一致
+        total = (
+            probe_data.get("iTotalDisplayRecords")
+            or probe_data.get("iTotalRecords")
+            or 0
+        )
+        try:
+            total = int(total)
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0:
+            log(f"⚠️ 探测调用未返回有效 iTotalRecords (got {total!r})，回退到 2000")
+            total = 2000
+        else:
+            log(f"🔢 服务器报告本学期共 {total} 门课，按此数量拉取")
+        display_length = total
+
+    resp = _http_post(
+        url, _build_course_list_body(term_id, display_length), cookies, timeout=35,
+        referer="https://jwgl.dhu.edu.cn/dhu/PublicQuery/toPage",
+    )
 
     if not resp:
         log("❌ 未获取到响应")
         return []
+
+    # Cookie 失效检测：抛 SessionExpired 让调用方触发重登录
+    _check_session_expired(resp)
 
     try:
         data = json.loads(resp)
@@ -175,11 +308,15 @@ def fetch_course_timetable(cookies, kcbh, term_id=88):
     url = "https://jwgl.dhu.edu.cn/dhu/PublicQuery/getCourseTimeTableInfo"
     post_data = f"kcbh={kcbh}&termId={term_id}"
 
-    cmd = ["curl", url, "--compressed", "-s", "--max-time", "30"] + _common_headers(cookies) + ["--data-raw", post_data]
-
-    resp = _run_curl(cmd, timeout=35)
+    resp = _http_post(
+        url, post_data, cookies, timeout=35,
+        referer="https://jwgl.dhu.edu.cn/dhu/PublicQuery/toPage",
+    )
     if not resp:
         return None
+
+    # Cookie 失效检测：抛 SessionExpired 让调用方触发重登录
+    _check_session_expired(resp)
 
     try:
         data = json.loads(resp)
@@ -205,7 +342,7 @@ def fetch_course_timetable(cookies, kcbh, term_id=88):
 def _parse_timetable_html(html):
     """
     用 BeautifulSoup 解析开课班级 HTML 表格。
-    每行: kcbh | kcmc | orgname | cttId | classNo | maxCnt | enrollCnt | applyCnt | (预留) | 教师 | (colspan=3 时间地点)
+    每行: kcbh | kcmc | orgname | cttId | classNo | maxCnt | enrollCnt | applyCnt | 建议优选专业 (校区) | 教师 | (colspan=3 时间地点)
     """
     soup = BeautifulSoup(html, "html.parser")
     classes = []
@@ -247,6 +384,9 @@ def _parse_timetable_html(html):
             "maxCnt": _int_or(txt(tds[5])),
             "enrollCnt": _int_or(txt(tds[6])),
             "applyCnt": _int_or(txt(tds[7])),
+            # td[8] 是"建议优选专业"列，对公共课等课程实际就是校区文本
+            # （如 "延安路校区" / "松江校区"），是最权威的校区来源
+            "suggested_major": txt(tds[8]),
             "teacher_name": teacher,
             "teacher_id": teacher_id,
             "schedule_raw": schedule_html,

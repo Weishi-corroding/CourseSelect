@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
     QSizePolicy, QStatusBar, QAbstractItemView, QGroupBox,
     QGridLayout, QMessageBox, QFileDialog, QSplitter,
-    QInputDialog, QAction,
+    QInputDialog, QAction, QDialog, QProgressBar, QTextEdit,
 )
 from PyQt5.QtGui import QFont, QColor, QBrush, QCursor
 from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
@@ -28,13 +28,19 @@ from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
 # ── 抓取课程线程 ─────────────────────────────────────────────────────
 from fetch_courses import (
     fetch_course_list, fetch_course_timetable, load_cookies_dict,
-    _common_headers,
+    _common_headers, SessionExpired,
 )
+# 自动重新登录依赖
+from core import get_cookies, load_accounts, save_cookies_dict
+
+# 自动重新登录用的默认账号（匹配 accounts.json 中的 name 字段）
+AUTO_RELOGIN_ACCOUNT_NAME = "卫宁远"
 
 
 class FetchCoursesThread(QThread):
     """后台抓取课程，完成后自动保存到 courses_full.json"""
     progress = pyqtSignal(str)
+    progress_step = pyqtSignal(int, int, str)  # (current_1based, total, label)；total=0 表示忙碌/不确定
     finished_signal = pyqtSignal(object)  # dict: 完整数据
     error_signal = pyqtSignal(str)
 
@@ -43,11 +49,74 @@ class FetchCoursesThread(QThread):
         self.cookie_str = cookie_str
         self.course_codes = course_codes   # None=全部, [list]=指定课程代码
         self.term_id = term_id
+        self._stop_requested = False
+        self._relogin_attempts = 0   # 一次会话内只允许重登一次，防死循环
+
+    def stop(self):
+        """请求中断抓取；run() 主循环每次迭代检查此标志"""
+        self._stop_requested = True
+
+    # ── 自动重新登录 ─────────────────────────────────────────────────
+    def _relogin(self):
+        """使用 accounts.json 中 AUTO_RELOGIN_ACCOUNT_NAME 的凭据重新登录，
+        更新 self.cookie_str 并写回 cookies.json。失败抛 RuntimeError。"""
+        self._relogin_attempts += 1
+        accounts = load_accounts()
+        acct = next((a for a in accounts if a.get("name") == AUTO_RELOGIN_ACCOUNT_NAME), None)
+        if not acct:
+            raise RuntimeError(
+                f"accounts.json 中未找到默认账号「{AUTO_RELOGIN_ACCOUNT_NAME}」，无法自动重新登录"
+            )
+
+        self.progress.emit(f"🔐 检测到 Cookie 失效，正在以「{AUTO_RELOGIN_ACCOUNT_NAME}」自动重新登录…")
+        self.progress_step.emit(0, 0, f"🔐 正在重新登录（{AUTO_RELOGIN_ACCOUNT_NAME}）…")
+
+        cookies_list = get_cookies(
+            acct["username"], acct["password"],
+            report_callback=self.progress.emit,
+        )
+        if not cookies_list:
+            raise RuntimeError("get_cookies 返回空")
+
+        new_cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
+
+        # 写回 cookies.json（覆盖 AUTO_RELOGIN_ACCOUNT_NAME 这一项，其它保留）
+        try:
+            all_cookies = load_cookies_dict()
+        except Exception:
+            all_cookies = {}
+        all_cookies[AUTO_RELOGIN_ACCOUNT_NAME] = new_cookie_str
+        try:
+            save_cookies_dict(all_cookies)
+        except Exception as e:
+            self.progress.emit(f"⚠️ 新 cookie 已获取但写回 cookies.json 失败: {e}")
+
+        self.cookie_str = new_cookie_str
+        self.progress.emit("✅ 重新登录成功，继续抓取…")
+
+    def _call_with_relogin(self, fn, *args, **kwargs):
+        """包裹 fetch_course_list / fetch_course_timetable：捕获 SessionExpired
+        触发一次自动重登录后重试一次。重登失败或重试仍失败则向上抛。
+
+        约定：被包裹的函数第一个位置参数必须是 cookie 字符串，由本方法
+        从 self.cookie_str 实时注入——这样 _relogin 写入的新 cookie 才会
+        被重试使用。"""
+        try:
+            return fn(self.cookie_str, *args, **kwargs)
+        except SessionExpired:
+            if self._relogin_attempts >= 1:
+                raise   # 已重登过一次仍失效，让外层 except 兜底
+            self._relogin()
+            # 重试一次（用 _relogin 刷新后的 self.cookie_str）
+            return fn(self.cookie_str, *args, **kwargs)
 
     def run(self):
         try:
             self.progress.emit("📡 正在获取课程列表...")
-            courses = fetch_course_list(self.cookie_str, term_id=self.term_id)
+            self.progress_step.emit(0, 0, "📡 获取课程列表中...")
+            courses = self._call_with_relogin(
+                fetch_course_list, term_id=self.term_id,
+            )
             if not courses:
                 self.error_signal.emit("❌ 获取课程列表失败（返回为空）")
                 return
@@ -99,17 +168,31 @@ class FetchCoursesThread(QThread):
             self.progress.emit(f"🚀 开始获取 {total} 门课程的详细信息...")
 
             results = []
+            cancelled = False
             for i, course in enumerate(normalized):
+                if self._stop_requested:
+                    cancelled = True
+                    self.progress.emit("⏹ 用户已取消抓取，停止后续请求")
+                    break
+
                 kcbh = course["kcbh"]
                 kcmc = course["kcmc"]
                 self.progress.emit(f"  [{i+1}/{total}] {kcbh} {kcmc}")
+                self.progress_step.emit(i + 1, total, f"{kcbh} {kcmc}")
 
-                timetable = fetch_course_timetable(self.cookie_str, kcbh, term_id=self.term_id)
+                timetable = self._call_with_relogin(
+                    fetch_course_timetable, kcbh, term_id=self.term_id,
+                )
                 results.append({**course, "timetable": timetable})
 
                 # 礼貌性延迟
                 if i < total - 1:
                     self.msleep(300)
+
+            if cancelled:
+                # 取消时不写文件、不发 finished_signal；仅作为 error_signal 路径之外的中性结束
+                self.error_signal.emit("⏹ 抓取已取消（未写入 courses_full.json）")
+                return
 
             # 组装输出
             output = {
@@ -157,6 +240,256 @@ class FetchCoursesThread(QThread):
 
 DATA_FILE = "courses_full.json"
 
+
+class FetchProgressDialog(QDialog):
+    """全量/指定课程抓取的实时进度弹窗。
+
+    镜像 modern_ui_production.py 中 CaptchaDialog / StyledInputDialog 的样式约定：
+    从 parent 读取 dark_mode，使用相同的紫色/蓝色渐变和按钮主题色。
+    """
+    def __init__(self, parent, thread):
+        super().__init__(parent)
+        self.thread = thread
+        self.dark_mode = getattr(parent, 'dark_mode', True)
+        self._finished = False  # 完成/出错后切换按钮行为
+
+        self.setWindowTitle("🌐 正在抓取课程数据")
+        self.setObjectName("FetchProgressDialog")
+        self.setMinimumSize(520, 380)
+        self.setWindowModality(Qt.ApplicationModal)
+        # 去掉右上角关闭按钮，只能通过底部按钮关闭，防止误关闭后线程仍在跑
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.WindowTitleHint)
+            & ~Qt.WindowCloseButtonHint
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        # 标题
+        title = QLabel("🌐 课程数据抓取进度")
+        title_font = QFont()
+        title_font.setPointSize(13)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        # 当前状态（正在抓什么）
+        self.status_label = QLabel("准备开始...")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        # 进度条 + 计数
+        bar_row = QHBoxLayout()
+        bar_row.setSpacing(10)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)  # 初始忙碌态
+        self.progress_bar.setTextVisible(True)
+        bar_row.addWidget(self.progress_bar, 1)
+
+        self.count_label = QLabel("— / —")
+        self.count_label.setMinimumWidth(80)
+        self.count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        bar_row.addWidget(self.count_label)
+        layout.addLayout(bar_row)
+
+        # 日志区
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(self.log_view, 1)
+
+        # 底部按钮
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn = QPushButton("取消")
+        self.btn.setMinimumWidth(100)
+        self.btn.clicked.connect(self._on_btn_clicked)
+        btn_row.addWidget(self.btn)
+        layout.addLayout(btn_row)
+
+        self._apply_style()
+
+    # ── 槽函数 ───────────────────────────────────────────────────────
+    def on_step(self, current, total, label):
+        """结构化进度信号入口：current=1基索引，total=总数（0 表示未知/忙碌），label=当前条目"""
+        if total > 0:
+            if self.progress_bar.maximum() != total:
+                self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(current)
+            self.count_label.setText(f"{current} / {total}")
+            self.status_label.setText(f"正在抓取：{label}")
+        else:
+            # 维持忙碌态
+            self.progress_bar.setRange(0, 0)
+            self.count_label.setText("— / —")
+            self.status_label.setText(label)
+
+    def on_log(self, msg):
+        """文本进度信号入口：累加到日志区，自动滚到底"""
+        self.log_view.append(msg)
+        sb = self.log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def on_finished(self, _data):
+        self._finished = True
+        # 进度条置满（若已知 total）
+        if self.progress_bar.maximum() > 0:
+            self.progress_bar.setValue(self.progress_bar.maximum())
+        else:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(1)
+        self.status_label.setText("✅ 抓取完成")
+        self.btn.setText("关闭")
+        self.btn.setEnabled(True)
+        # 允许窗口栏关闭按钮可用（如果系统重新加上）
+        self.setWindowFlags(self.windowFlags() | Qt.WindowCloseButtonHint)
+        self.show()  # 重应用 windowFlags 需要重新 show
+
+    def on_error(self, msg):
+        self._finished = True
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("❌ 抓取中断 / 出错")
+        self.log_view.append(msg)
+        self.btn.setText("关闭")
+        self.btn.setEnabled(True)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowCloseButtonHint)
+        self.show()
+
+    def _on_btn_clicked(self):
+        if self._finished:
+            self.accept()
+            return
+        # 线程仍在跑 → 请求中断
+        if self.thread is not None:
+            try:
+                self.thread.stop()
+            except Exception:
+                pass
+        self.btn.setText("正在取消…")
+        self.btn.setEnabled(False)
+        self.status_label.setText("⏹ 正在取消，等待当前请求结束…")
+
+    def closeEvent(self, event):
+        # 只允许在 _finished 后通过窗口关闭按钮关闭
+        if self._finished:
+            event.accept()
+        else:
+            event.ignore()
+
+    def keyPressEvent(self, event):
+        # ESC 等同点击按钮：未完成时走"取消"，完成后才允许关闭
+        if event.key() == Qt.Key_Escape:
+            self._on_btn_clicked()
+            return
+        super().keyPressEvent(event)
+
+    # ── 样式 ──────────────────────────────────────────────────────────
+    def _apply_style(self):
+        if self.dark_mode:
+            self.setStyleSheet("""
+                QDialog#FetchProgressDialog {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #202040, stop:0.5 #1a1a2e, stop:1 #202060);
+                    color: white;
+                }
+                QDialog#FetchProgressDialog QLabel {
+                    color: white;
+                    background: transparent;
+                }
+                QDialog#FetchProgressDialog QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #4B0082, stop:1 #483D8B);
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QDialog#FetchProgressDialog QPushButton:hover {
+                    background: #6A5ACD;
+                }
+                QDialog#FetchProgressDialog QPushButton:disabled {
+                    background: #3a3a5e;
+                    color: #aaaaaa;
+                }
+                QDialog#FetchProgressDialog QProgressBar {
+                    border: 1px solid #4B0082;
+                    border-radius: 6px;
+                    background: rgba(255, 255, 255, 0.08);
+                    color: white;
+                    text-align: center;
+                    height: 22px;
+                }
+                QDialog#FetchProgressDialog QProgressBar::chunk {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #4B0082, stop:1 #6A5ACD);
+                    border-radius: 5px;
+                }
+                QDialog#FetchProgressDialog QTextEdit {
+                    background: rgba(0, 0, 0, 0.25);
+                    color: #e8e8f5;
+                    border: 1px solid #4B0082;
+                    border-radius: 6px;
+                    padding: 6px;
+                    font-family: Consolas, "Courier New", monospace;
+                    font-size: 11px;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QDialog#FetchProgressDialog {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #F0F3F9, stop:0.5 #E6EAF0, stop:1 #DCE4F0);
+                    color: #202020;
+                }
+                QDialog#FetchProgressDialog QLabel {
+                    color: #202020;
+                    background: transparent;
+                }
+                QDialog#FetchProgressDialog QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #3B82F6, stop:1 #2563EB);
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QDialog#FetchProgressDialog QPushButton:hover {
+                    background: #1D4ED8;
+                }
+                QDialog#FetchProgressDialog QPushButton:disabled {
+                    background: #c0c8d6;
+                    color: #ffffff;
+                }
+                QDialog#FetchProgressDialog QProgressBar {
+                    border: 1px solid #3B82F6;
+                    border-radius: 6px;
+                    background: rgba(255, 255, 255, 0.6);
+                    color: #1f2937;
+                    text-align: center;
+                    height: 22px;
+                }
+                QDialog#FetchProgressDialog QProgressBar::chunk {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #3B82F6, stop:1 #2563EB);
+                    border-radius: 5px;
+                }
+                QDialog#FetchProgressDialog QTextEdit {
+                    background: rgba(255, 255, 255, 0.7);
+                    color: #1f2937;
+                    border: 1px solid #3B82F6;
+                    border-radius: 6px;
+                    padding: 6px;
+                    font-family: Consolas, "Courier New", monospace;
+                    font-size: 11px;
+                }
+            """)
+
+
 # ── 星期映射 ──────────────────────────────────────────────────────
 DAY_MAP = {
     "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
@@ -182,13 +515,53 @@ def parse_time_slot(text):
 
 
 def detect_campus(classroom):
-    """根据教室名判断校区"""
+    """根据教室名判断校区（兜底法：仅在 suggested_major 不可用时使用）。
+
+    DHU 主要两个校区命名约定：
+      - 松江校区: 以 '松' 开头，例：松1334、松2138
+      - 延安路校区: 多数为数字+'教'，例：1教101、4教310、8教205；
+                    少数历史命名直接以 '延' 开头。
+    其他（'线上教学'、外部场地等）返回 '' 视为未知。
+    """
     if not classroom:
         return ""
-    if classroom.startswith("松"):
+    s = classroom.strip()
+    if s.startswith("松"):
         return "松江"
-    if classroom.startswith("延"):
+    if s.startswith("延"):
         return "延安路"
+    # <digit>+教 → 延安路（1教/2教/3教/4教/8教 等）
+    if re.match(r"^\d+教", s):
+        return "延安路"
+    return ""
+
+
+def detect_campus_from_major(suggested_major):
+    """从「建议优选专业」字段抽取校区。
+
+    部分课程（尤其是公共课）此列存的是 "延安路校区" / "松江校区" 这类
+    明确的校区名；对专业课则可能是具体专业名（如 "信息工程"），抽不到
+    返回 ''，由调用方回退到 detect_campus 用教室兜底。
+    """
+    if not suggested_major:
+        return ""
+    s = suggested_major
+    if "松江" in s:
+        return "松江"
+    if "延安路" in s:
+        return "延安路"
+    return ""
+
+
+def class_campus(cls):
+    """优先 suggested_major，回退到第一条 schedule 的教室"""
+    by_major = detect_campus_from_major(cls.get("suggested_major", ""))
+    if by_major:
+        return by_major
+    for sch in (cls.get("schedule") or []):
+        c = detect_campus(sch.get("classroom", ""))
+        if c:
+            return c
     return ""
 
 
@@ -198,13 +571,15 @@ class CourseQueryEngine:
         self.courses = data.get("courses", [])
 
     def query(self, course_code_prefix="", course_name_keyword="", campus="", only_available=False,
-              day_filter=0, period_filter=0):
+              day_filter=0, period_filter=0, teacher_keyword=""):
         """
         核心筛选逻辑。
         day_filter: 0=全部, 1-7=周一到周日
         period_filter: 0=全部, 1-13=具体节次
+        teacher_keyword: 教师姓名部分匹配（不区分大小写，作用在班级层级）
         """
         results = []
+        teacher_kw = teacher_keyword.strip().lower()
 
         for course in self.courses:
             kcbh = course.get("kcbh", "")
@@ -233,6 +608,12 @@ class CourseQueryEngine:
                 enroll_cnt = cls.get("enrollCnt", 0)
                 max_cnt = cls.get("maxCnt", 0)
 
+                # 教师姓名部分匹配（班级粒度，不区分大小写）
+                if teacher_kw:
+                    teacher_name = (cls.get("teacher_name", "") or "").lower()
+                    if teacher_kw not in teacher_name:
+                        continue
+
                 # 未录满筛选
                 if only_available and enroll_cnt >= max_cnt:
                     continue
@@ -243,14 +624,14 @@ class CourseQueryEngine:
 
                 # 时间筛选：只要该班级任一 schedule 匹配即保留
                 if day_filter > 0 or period_filter > 0:
+                    # 校区筛选（班级级别，优先 suggested_major 字段）
+                    cls_campus = class_campus(cls)
+                    if campus and cls_campus and cls_campus != campus:
+                        continue
+
                     matched = False
                     for sch in schedules:
                         day, periods = parse_time_slot(sch.get("time_slot", ""))
-                        campus_sch = detect_campus(sch.get("classroom", ""))
-
-                        # 校区筛选（从 schedule 的教室判断）
-                        if campus and campus_sch and campus_sch != campus:
-                            continue
 
                         # 星期匹配
                         if day_filter > 0:
@@ -266,21 +647,13 @@ class CourseQueryEngine:
                         break
 
                     if not matched:
-                        # 如果是校区筛选但无 schedule，尝试从其他字段判断
-                        if campus and not schedules:
-                            # 无法判断校区，跳过
-                            continue
-                        elif day_filter > 0 or period_filter > 0:
+                        if day_filter > 0 or period_filter > 0:
                             continue
                 else:
-                    # 校区筛选（无时间筛选时）
+                    # 校区筛选（无时间筛选时，班级级别优先 suggested_major 字段）
                     if campus:
-                        has_campus = False
-                        for sch in schedules:
-                            if detect_campus(sch.get("classroom", "")) == campus:
-                                has_campus = True
-                                break
-                        if not has_campus:
+                        cls_campus = class_campus(cls)
+                        if cls_campus and cls_campus != campus:
                             continue
 
                 # 构建显示用时间字符串
@@ -302,7 +675,7 @@ class CourseQueryEngine:
                     "applyCnt": cls.get("applyCnt", 0),
                     "teacher": cls.get("teacher_name", ""),
                     "schedule": time_str,
-                    "campus": detect_campus(schedules[0].get("classroom", "")) if schedules else "",
+                    "campus": class_campus(cls),
                 })
 
         return results
@@ -390,6 +763,15 @@ class CourseQueryUI(QMainWindow):
         self.campus_combo.setFont(QFont("Microsoft YaHei UI", 11))
         self.campus_combo.setMinimumHeight(34)
         filter_layout.addWidget(self.campus_combo, 1, 5)
+
+        # 第三行：教师姓名
+        filter_layout.addWidget(QLabel("教师姓名:"), 2, 0)
+        self.teacher_input = QLineEdit()
+        self.teacher_input.setPlaceholderText("部分匹配，如 王")
+        self.teacher_input.setFont(QFont("Microsoft YaHei UI", 11))
+        self.teacher_input.setMinimumHeight(34)
+        self.teacher_input.returnPressed.connect(self._do_query)
+        filter_layout.addWidget(self.teacher_input, 2, 1)
 
         # 按钮行
         btn_layout = QHBoxLayout()
@@ -651,7 +1033,7 @@ class CourseQueryUI(QMainWindow):
             "即将从教务系统重新抓取全部课程的详细开课信息。\n"
             "此过程需要较长时间，请确保网络连接正常。\n\n"
             "继续吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
         )
         if reply != QMessageBox.Yes:
             return
@@ -675,7 +1057,7 @@ class CourseQueryUI(QMainWindow):
             f"即将抓取 {len(codes)} 门指定课程的详细信息：\n"
             f"{'、'.join(codes[:10])}{'...' if len(codes) > 10 else ''}\n\n"
             "继续吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
         )
         if reply != QMessageBox.Yes:
             return
@@ -698,11 +1080,23 @@ class CourseQueryUI(QMainWindow):
 
         # 创建并启动线程
         self.fetch_thread = FetchCoursesThread(cookie_str, course_codes=course_codes)
+
+        # 进度弹窗
+        self.fetch_dialog = FetchProgressDialog(self, self.fetch_thread)
+
+        # 文本进度：同时进状态栏 / count_label / 弹窗日志
         self.fetch_thread.progress.connect(self._on_fetch_progress)
+        self.fetch_thread.progress.connect(self.fetch_dialog.on_log)
+        # 结构化进度 → 弹窗进度条
+        self.fetch_thread.progress_step.connect(self.fetch_dialog.on_step)
+        # 终态：弹窗自己切按钮、主窗口走既有处理
+        self.fetch_thread.finished_signal.connect(self.fetch_dialog.on_finished)
+        self.fetch_thread.error_signal.connect(self.fetch_dialog.on_error)
         self.fetch_thread.finished_signal.connect(self._on_fetch_finished)
         self.fetch_thread.error_signal.connect(self._on_fetch_error)
-        self.fetch_thread.start()
 
+        self.fetch_thread.start()
+        self.fetch_dialog.show()  # 非阻塞；ApplicationModal 阻断主窗交互
         self.statusBar().showMessage(f"🔄 正在抓取课程数据（用户: {user}）...")
 
     def _on_fetch_progress(self, msg):
@@ -765,6 +1159,7 @@ class CourseQueryUI(QMainWindow):
 
         prefix = self.code_input.text().strip()
         name_keyword = self.name_input.text().strip()
+        teacher_keyword = self.teacher_input.text().strip()
         campus_text = self.campus_combo.currentText()
         campus = campus_text if campus_text != "全部" else ""
         only_avail = self.avail_check.isChecked()
@@ -782,6 +1177,7 @@ class CourseQueryUI(QMainWindow):
             only_available=only_avail,
             day_filter=day,
             period_filter=period,
+            teacher_keyword=teacher_keyword,
         )
 
         self._populate_table(results)
@@ -789,6 +1185,7 @@ class CourseQueryUI(QMainWindow):
     def _do_reset(self):
         self.code_input.clear()
         self.name_input.clear()
+        self.teacher_input.clear()
         self.campus_combo.setCurrentIndex(0)
         self.avail_check.setChecked(False)
         self.day_combo.setCurrentIndex(0)
