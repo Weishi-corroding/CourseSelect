@@ -6,6 +6,7 @@ import os
 import time
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import Qt
 
 # 导入生产版本的 Glassmorphism UI
 from modern_ui_production import ProductionGlassmorphismUI
@@ -80,7 +81,9 @@ def main():
             return os.path.join(sys._MEIPASS, relative_path)
         return os.path.join(os.path.dirname(__file__), relative_path)
 
-    app = QApplication([])
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
     # 尝试加载应用图标

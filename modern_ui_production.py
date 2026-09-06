@@ -7,14 +7,18 @@ import os
 import json
 import random
 import threading
+import time
+import math
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox,
     QGridLayout, QFrame, QTabWidget, QMessageBox, QFileDialog,
     QListWidget, QDialog, QSizePolicy, QInputDialog,
-    QCheckBox, QScrollArea, QApplication
+    QCheckBox, QScrollArea, QApplication, QFormLayout,
+    QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QHeaderView,
+    QAbstractItemView
 )
-from PyQt5.QtGui import QFont, QColor, QCursor
+from PyQt5.QtGui import QFont, QColor, QCursor, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer, QTime
 
 # 导入 core
@@ -26,8 +30,22 @@ from core import (
 )
 
 file_lock = QMutex()
+from ui_support import BufferedLogView, InterruptibleThread, workspace_style
 
-class SingleCourseWorker(QThread):
+
+class DeletableListWidget(QListWidget):
+    """A list whose selected rows can be removed with the Delete key."""
+
+    delete_requested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete and self.selectedIndexes():
+            self.delete_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+class SingleCourseWorker(InterruptibleThread):
     """单门课程抢课线程 - 智能防风控版"""
     log_signal = pyqtSignal(str)
     success_signal = pyqtSignal(str)
@@ -162,11 +180,11 @@ class SingleCourseWorker(QThread):
                 if len(d[self.user_display_name]) < original_len:
                     save_courses(d)
         except: pass
-    def stop(self): self.is_running = False
+    def stop(self): super().stop()
 
 
 # === 捡漏模式工作线程 (修复版) ===
-class PickUpWorker(QThread):
+class PickUpWorker(InterruptibleThread):
     """捡漏模式线程：完全模拟 [权限检查 -> 查询] 循环"""
     log_signal = pyqtSignal(str)
     success_signal = pyqtSignal(str)
@@ -339,11 +357,11 @@ class PickUpWorker(QThread):
         except: pass
 
     def stop(self):
-        self.is_running = False
+        super().stop()
 
 
 # === 升级课程线程 ===
-class UpgradeWorker(QThread):
+class UpgradeWorker(InterruptibleThread):
     """
     升级课程：监控目标课程，发现空位时先退掉旧课、再选新课。
     流程：initACC(kcbh_target) → 发现空位 →
@@ -550,9 +568,9 @@ class UpgradeWorker(QThread):
             cleanup_thread_session()
 
     def stop(self):
-        self.is_running = False
+        super().stop()
 
-class PreWorkThread(QThread):
+class PreWorkThread(InterruptibleThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
     def __init__(self, cookies, delete_list, interval=1):
@@ -561,20 +579,58 @@ class PreWorkThread(QThread):
         self.delete_list = delete_list
         self.interval = interval
     def run(self):
-        if self.delete_list:
-            self.log_signal.emit(f"{'='*40}\n📌 开始处理待删除课程 ({len(self.delete_list)}门)")
+        try:
+            if self.delete_list:
+                self.log_signal.emit(f"📌 开始处理待删除课程 ({len(self.delete_list)}门)")
             for item in self.delete_list:
-                cc = item.get("courseCode", "")
-                cn = item.get("classNo", "")
+                if not self.is_running:
+                    break
+                cc, cn = item.get("courseCode", ""), item.get("classNo", "")
                 self.log_signal.emit(f"⏳ 正在删除: {cc} (班序: {cn})")
                 try:
-                    res = cancelSC(self.cookies, cc, cn)
-                    self.log_signal.emit(f"  📝 结果: {res}")
+                    self.log_signal.emit(f"  📝 结果: {cancelSC(self.cookies, cc, cn)}")
                 except Exception as e:
                     self.log_signal.emit(f"  ⚠️ 异常: {e}")
                 self.msleep(int(self.interval * 1000))
-            self.log_signal.emit(f"✅ 退课处理完成\n{'='*40}")
-        self.finished_signal.emit()
+            if self.is_running:
+                self.finished_signal.emit()
+        finally:
+            cleanup_thread_session()
+
+
+class CookieUpdateWorker(InterruptibleThread):
+    log_signal = pyqtSignal(str)
+    result_signal = pyqtSignal(int, int)
+
+    def __init__(self, accounts, parent=None):
+        super().__init__(parent)
+        self.accounts = accounts
+
+    def run(self):
+        success = failures = 0
+        try:
+            for index, account in enumerate(self.accounts, 1):
+                if not self.is_running:
+                    break
+                name = account['name']
+                self.log_signal.emit(f"[{index}/{len(self.accounts)}] 正在更新 {name}")
+                try:
+                    cookies = get_cookies(account['username'], account['password'],
+                                          report_callback=self.log_signal.emit)
+                    if not cookies:
+                        raise RuntimeError("未获取到有效 Cookie")
+                    with QMutexLocker(file_lock):
+                        saved = load_cookies_dict()
+                        saved[name] = '; '.join(f"{c['name']}={c['value']}" for c in cookies)
+                        save_cookies_dict(saved)
+                    success += 1
+                    self.log_signal.emit(f"✓ {name} 更新成功")
+                except Exception as exc:
+                    failures += 1
+                    self.log_signal.emit(f"更新失败 [{name}]: {exc}")
+            self.result_signal.emit(success, failures)
+        finally:
+            cleanup_thread_session()
 
 class StyledInputDialog(QDialog):
     def __init__(self, parent, title, prompt, is_multiline=False):
@@ -607,74 +663,36 @@ class StyledInputDialog(QDialog):
         layout.addLayout(button_layout)
         self.apply_style()
     def apply_style(self):
-        if self.dark_mode:
-            self.setStyleSheet("""
-                QDialog {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #202040, stop:0.5 #1a1a2e, stop:1 #202060);
-                    color: white;
-                }
-                QLabel { color: white; font-size: 13px; }
-                QLineEdit, QTextEdit {
-                    background: rgba(255,255,255,0.1);
-                    color: white;
-                    border: 1px solid rgba(255,255,255,0.15);
-                    border-radius: 6px;
-                    padding: 6px 10px;
-                    font-size: 13px;
-                }
-                QLineEdit:focus, QTextEdit:focus {
-                    border: 1px solid #6A5ACD;
-                }
-                QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #4B0082, stop:1 #483D8B);
-                    color: white;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 8px 20px;
-                    font-weight: bold;
-                    min-width: 80px;
-                }
-                QPushButton:hover {
-                    background: #6A5ACD;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QDialog {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #F0F3F9, stop:0.5 #E6EAF0, stop:1 #DCE4F0);
-                    color: #202020;
-                }
-                QLabel { color: #202020; font-size: 13px; }
-                QLineEdit, QTextEdit {
-                    background: white;
-                    color: #202020;
-                    border: 1px solid rgba(0,0,0,0.12);
-                    border-radius: 6px;
-                    padding: 6px 10px;
-                    font-size: 13px;
-                }
-                QLineEdit:focus, QTextEdit:focus {
-                    border: 1px solid #3B82F6;
-                }
-                QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #3B82F6, stop:1 #2563EB);
-                    color: white;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 8px 20px;
-                    font-weight: bold;
-                    min-width: 80px;
-                }
-                QPushButton:hover {
-                    background: #2563EB;
-                }
-            """)
+        self.setStyleSheet(workspace_style(self.dark_mode))
     def get_value(self):
         return self.input_field.toPlainText() if isinstance(self.input_field, QTextEdit) else self.input_field.text()
+
+
+class CaptchaImageWorker(QThread):
+    image_signal = pyqtSignal(bytes)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, cookies, parent=None):
+        super().__init__(parent)
+        self.cookies = cookies
+
+    def run(self):
+        try:
+            import requests
+            with requests.get(
+                "https://jwgl.dhu.edu.cn/dhu/captcha/code",
+                headers={
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"),
+                    "Referer": "https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH",
+                },
+                cookies=self.cookies, timeout=15,
+            ) as response:
+                response.raise_for_status()
+                self.image_signal.emit(response.content)
+        except Exception as exc:
+            self.error_signal.emit(f"加载失败，点击刷新重试: {exc}")
 
 
 class CaptchaDialog(QDialog):
@@ -686,6 +704,8 @@ class CaptchaDialog(QDialog):
         self.cookies = cookies
         self.dark_mode = getattr(parent, 'dark_mode', False)
         self._cap_code = ""
+        self.image_worker = None
+        self._pending_result = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
@@ -702,6 +722,7 @@ class CaptchaDialog(QDialog):
         layout.addWidget(self.image_label)
 
         refresh_btn = QPushButton("🔄 刷新验证码")
+        self.refresh_button = refresh_btn
         refresh_btn.setFont(QFont("Microsoft YaHei UI", 11))
         refresh_btn.setCursor(QCursor(Qt.PointingHandCursor))
         refresh_btn.clicked.connect(self._fetch_captcha_image)
@@ -742,258 +763,353 @@ class CaptchaDialog(QDialog):
         return cookies
 
     def _fetch_captcha_image(self):
+        if self.image_worker is not None:
+            return
         self.image_label.setText("⏳ 加载验证码中...")
-        QThread.msleep(50)
-        QApplication.processEvents()
-        try:
-            import requests
-            headers = {
-                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"),
-                "Referer": "https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH",
-            }
-            resp = requests.get(
-                "https://jwgl.dhu.edu.cn/dhu/captcha/code",
-                headers=headers,
-                cookies=self._parse_cookies(),
-                timeout=15
-            )
-            if resp.status_code == 200:
-                pixmap = QPixmap()
-                if pixmap.loadFromData(resp.content):
-                    scaled = pixmap.scaledToHeight(80, Qt.SmoothTransformation)
-                    self.image_label.setPixmap(scaled)
-                else:
-                    self.image_label.setText("⚠️ 图片解析失败，点击刷新重试")
-            else:
-                self.image_label.setText(f"⚠️ 请求失败 (HTTP {resp.status_code})")
-        except Exception as e:
-            self.image_label.setText(f"❌ 加载失败: {e}")
+        self.refresh_button.setEnabled(False)
+        self.image_worker = CaptchaImageWorker(self._parse_cookies(), self)
+        self.image_worker.image_signal.connect(self._show_captcha_image)
+        self.image_worker.error_signal.connect(self.image_label.setText)
+        self.image_worker.finished.connect(self._image_finished)
+        self.image_worker.start()
+
+    def _show_captcha_image(self, content):
+        pixmap = QPixmap()
+        if pixmap.loadFromData(content):
+            self.image_label.setPixmap(pixmap.scaledToHeight(80, Qt.SmoothTransformation))
+        else:
+            self.image_label.setText("图片解析失败，点击刷新重试")
+
+    def _image_finished(self):
+        self.image_worker.deleteLater()
+        self.image_worker = None
+        self.refresh_button.setEnabled(True)
+        if self._pending_result is not None:
+            self.done(self._pending_result)
+
+    def done(self, result):
+        if self.image_worker is not None:
+            self._pending_result = result
+            self.image_label.setText("正在结束图片请求…")
+            return
+        super().done(result)
 
     def get_value(self):
         return self.input_field.text().strip()
 
     def _apply_style(self):
-        if self.dark_mode:
-            self.setStyleSheet("""
-                QDialog { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 #202040, stop:0.5 #1a1a2e, stop:1 #202060); color: white; }
-                QLabel { color: white; font-size: 13px; }
-                QLineEdit {
-                    background: rgba(255,255,255,0.1); color: white;
-                    border: 2px solid rgba(255,255,255,0.2); border-radius: 8px;
-                    padding: 6px 10px; font-size: 16px;
-                }
-                QLineEdit:focus { border: 2px solid #6A5ACD; }
-                QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #4B0082, stop:1 #483D8B);
-                    color: white; border: none; border-radius: 6px;
-                    padding: 8px 16px; font-weight: bold;
-                }
-                QPushButton:hover { background: #6A5ACD; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QDialog { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 #F0F3F9, stop:0.5 #E6EAF0, stop:1 #DCE4F0); color: #202020; }
-                QLabel { color: #202020; font-size: 13px; }
-                QLineEdit {
-                    background: white; color: #202020;
-                    border: 2px solid rgba(0,0,0,0.15); border-radius: 8px;
-                    padding: 6px 10px; font-size: 16px;
-                }
-                QLineEdit:focus { border: 2px solid #3B82F6; }
-                QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #3B82F6, stop:1 #2563EB);
-                    color: white; border: none; border-radius: 6px;
-                    padding: 8px 16px; font-weight: bold;
-                }
-                QPushButton:hover { background: #2563EB; }
-            """)
+        self.setStyleSheet(workspace_style(self.dark_mode))
 
 
 # === 多选账号弹窗 ===
 class SelectAccountsDialog(QDialog):
-    """显示所有账号，用复选框选择需要更新 Cookie 的目标"""
+    """Responsive account picker used by the Cookie refresh workflow."""
+
     def __init__(self, parent, accounts):
         super().__init__(parent)
-        self.setWindowTitle("选择要更新 Cookie 的账号")
-        self.setMinimumSize(480, 350)
+        self.setWindowTitle("更新 Cookie")
+        self.setMinimumSize(520, 380)
+        self.resize(
+            max(520, min(760, int(parent.width() * 0.68))),
+            max(380, min(620, int(parent.height() * 0.72))),
+        )
         self.dark_mode = getattr(parent, 'dark_mode', False)
         self.setObjectName("SelectAccountsDialog")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(14)
 
-        # 标题
-        title = QLabel("请勾选需要更新 Cookie 的账号：")
-        title.setFont(QFont("Microsoft YaHei UI", 13))
+        title = QLabel("更新账号 Cookie")
+        title.setObjectName("Title")
         layout.addWidget(title)
+        description = QLabel("选择需要重新登录的账号。更新在后台依次执行，期间界面仍可正常操作。")
+        description.setObjectName("Muted")
+        description.setWordWrap(True)
+        layout.addWidget(description)
 
-        # 全选 / 取消全选
-        self.select_all_cb = QCheckBox("全选 / 取消全选")
-        self.select_all_cb.setFont(QFont("Microsoft YaHei UI", 11))
+        controls = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索姓名或学号")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._filter_accounts)
+        controls.addWidget(self.search_input, 1)
+        self.select_all_cb = QCheckBox("选择全部")
         self.select_all_cb.stateChanged.connect(self._on_select_all)
-        layout.addWidget(self.select_all_cb)
+        controls.addWidget(self.select_all_cb)
+        layout.addLayout(controls)
 
-        # 账号复选框列表
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll_container = QWidget()
-        self.checkbox_layout = QVBoxLayout(scroll_container)
-        self.checkbox_layout.setContentsMargins(0, 0, 0, 0)
-        self.checkbox_layout.setSpacing(6)
+        self.account_tree = QTreeWidget()
+        self.account_tree.setColumnCount(3)
+        self.account_tree.setHeaderLabels(("选课人", "学号", "Cookie 状态"))
+        self.account_tree.setRootIsDecorated(False)
+        self.account_tree.setAlternatingRowColors(True)
+        self.account_tree.setUniformRowHeights(True)
+        self.account_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.account_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.account_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.account_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.account_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.account_tree.itemChanged.connect(self._update_count)
+        self.account_tree.itemSelectionChanged.connect(self._update_count)
 
-        self.account_checkboxes = []
-        # 读取已有 cookie 信息
+        self.account_items = []
         cookies_dict = load_cookies_dict()
         for acc in accounts:
             name = acc["name"]
             uid = acc["username"]
-            has_cookie = "✅" if cookies_dict.get(name) else "❌"
-            cb = QCheckBox(f"{has_cookie}  {name}  (ID: {uid})")
-            cb.setFont(QFont("Microsoft YaHei UI", 11))
-            cb.setChecked(False)
-            cb.acc_info = acc  # 挂载账号信息
-            self.checkbox_layout.addWidget(cb)
-            self.account_checkboxes.append(cb)
+            status = "已有 Cookie" if cookies_dict.get(name) else "需要更新"
+            item = QTreeWidgetItem((name, uid, status))
+            item.setCheckState(0, Qt.Unchecked)
+            item.acc_info = acc
+            self.account_tree.addTopLevelItem(item)
+            self.account_items.append(item)
+        layout.addWidget(self.account_tree, 1)
 
-        self.checkbox_layout.addStretch()
-        scroll.setWidget(scroll_container)
-        layout.addWidget(scroll, 1)
-
-        # 底部统计 + 按钮
         info_layout = QHBoxLayout()
         self.count_label = QLabel(f"已选择 0 / {len(accounts)} 个账号")
-        self.count_label.setFont(QFont("Microsoft YaHei UI", 11))
+        self.count_label.setObjectName("Muted")
         info_layout.addWidget(self.count_label)
         info_layout.addStretch()
 
         ok_btn = QPushButton("确定更新")
-        ok_btn.setObjectName("DialogOkBtn")
-        ok_btn.setFont(QFont("Microsoft YaHei UI", 12, QFont.Bold))
+        ok_btn.setObjectName("Primary")
         ok_btn.setMinimumSize(120, 38)
         ok_btn.clicked.connect(self.accept)
         info_layout.addWidget(ok_btn)
 
         cancel_btn = QPushButton("取消")
-        cancel_btn.setObjectName("DialogCancelBtn")
-        cancel_btn.setFont(QFont("Microsoft YaHei UI", 12))
         cancel_btn.setMinimumSize(80, 38)
         cancel_btn.clicked.connect(self.reject)
         info_layout.addWidget(cancel_btn)
 
         layout.addLayout(info_layout)
-
-        # 监听复选框变化以更新计数
-        for cb in self.account_checkboxes:
-            cb.stateChanged.connect(self._update_count)
         self._update_count()
         self._apply_style()
 
     def _on_select_all(self, state):
         checked = state == Qt.Checked
-        for cb in self.account_checkboxes:
-            cb.setChecked(checked)
+        self.account_tree.blockSignals(True)
+        for item in self.account_items:
+            if not item.isHidden():
+                item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+        self.account_tree.blockSignals(False)
+        self._update_count()
+
+    def _filter_accounts(self, text):
+        query = text.strip().casefold()
+        for item in self.account_items:
+            hidden = query not in f"{item.text(0)} {item.text(1)}".casefold()
+            item.setHidden(hidden)
+            if hidden:
+                item.setSelected(False)
+        self._update_count()
 
     def _update_count(self):
-        selected = sum(1 for cb in self.account_checkboxes if cb.isChecked())
-        total = len(self.account_checkboxes)
+        selected = sum(item.checkState(0) == Qt.Checked or item.isSelected()
+                       for item in self.account_items)
+        total = len(self.account_items)
         self.count_label.setText(f"已选择 {selected} / {total} 个账号")
 
     def get_selected_accounts(self):
-        return [cb.acc_info for cb in self.account_checkboxes if cb.isChecked()]
+        return [item.acc_info for item in self.account_items
+                if item.checkState(0) == Qt.Checked or item.isSelected()]
 
     def _apply_style(self):
-        if self.dark_mode:
-            self.setStyleSheet("""
-                QDialog#SelectAccountsDialog {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #202040, stop:0.5 #1a1a2e, stop:1 #202060);
-                    color: white;
-                }
-                QLabel { color: white; }
-                QCheckBox {
-                    color: white; spacing: 10px;
-                    padding: 6px 8px;
-                    border-radius: 6px;
-                }
-                QCheckBox:hover {
-                    background: rgba(255,255,255,0.08);
-                }
-                QCheckBox::indicator {
-                    width: 20px; height: 20px;
-                    border: 2px solid rgba(255,255,255,0.3);
-                    border-radius: 4px;
-                    background: transparent;
-                }
-                QCheckBox::indicator:checked {
-                    background: #4B0082;
-                    border-color: #6A5ACD;
-                }
-                QCheckBox::indicator:hover {
-                    border-color: rgba(255,255,255,0.6);
-                }
-                QScrollArea { border: none; background: transparent; }
-                QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #4B0082, stop:1 #483D8B);
-                    color: white; border: none; border-radius: 6px;
-                    padding: 8px 16px;
-                }
-                QPushButton:hover { background: #6A5ACD; }
-                QPushButton#DialogCancelBtn {
-                    background: rgba(255,255,255,0.1);
-                }
-                QPushButton#DialogCancelBtn:hover {
-                    background: rgba(255,255,255,0.2);
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QDialog#SelectAccountsDialog {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #F0F3F9, stop:0.5 #E6EAF0, stop:1 #DCE4F0);
-                    color: #202020;
-                }
-                QLabel { color: #202020; }
-                QCheckBox {
-                    color: #202020; spacing: 10px;
-                    padding: 6px 8px;
-                    border-radius: 6px;
-                }
-                QCheckBox:hover {
-                    background: rgba(0,0,0,0.03);
-                }
-                QCheckBox::indicator {
-                    width: 20px; height: 20px;
-                    border: 2px solid rgba(0,0,0,0.2);
-                    border-radius: 4px;
-                    background: white;
-                }
-                QCheckBox::indicator:checked {
-                    background: #3B82F6;
-                    border-color: #2563EB;
-                }
-                QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #3B82F6, stop:1 #2563EB);
-                    color: white; border: none; border-radius: 6px;
-                    padding: 8px 16px;
-                }
-                QPushButton:hover { background: #2563EB; }
-                QPushButton#DialogCancelBtn {
-                    background: rgba(0,0,0,0.08);
-                }
-                QPushButton#DialogCancelBtn:hover {
-                    background: rgba(0,0,0,0.15);
-                }
-            """)
+        self.setStyleSheet(workspace_style(self.dark_mode))
+
+
+class AccountEditorDialog(QDialog):
+    """Add or edit one account without exposing its password."""
+
+    def __init__(self, parent, account=None):
+        super().__init__(parent)
+        self.dark_mode = getattr(parent, "dark_mode", False)
+        self.setWindowTitle("编辑选课人" if account else "添加选课人")
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(16)
+        title = QLabel(self.windowTitle())
+        title.setObjectName("Title")
+        layout.addWidget(title)
+        form = QFormLayout()
+        form.setSpacing(12)
+        self.name_input = QLineEdit((account or {}).get("name", ""))
+        self.name_input.setPlaceholderText("用于界面显示")
+        self.username_input = QLineEdit((account or {}).get("username", ""))
+        self.username_input.setPlaceholderText("学号")
+        self.password_input = QLineEdit((account or {}).get("password", ""))
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setPlaceholderText("统一身份认证密码")
+        form.addRow("显示名称", self.name_input)
+        form.addRow("学号", self.username_input)
+        form.addRow("密码", self.password_input)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        buttons.button(QDialogButtonBox.Save).setText("保存")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setStyleSheet(workspace_style(self.dark_mode))
+
+    def accept(self):
+        if not all((self.name_input.text().strip(), self.username_input.text().strip(),
+                    self.password_input.text())):
+            QMessageBox.warning(self, "信息不完整", "名称、学号和密码都不能为空。")
+            return
+        super().accept()
+
+    def account(self):
+        return {
+            "name": self.name_input.text().strip(),
+            "username": self.username_input.text().strip(),
+            "password": self.password_input.text(),
+        }
+
+
+class ManageAccountsDialog(QDialog):
+    """Manage account records and their associated local configuration."""
+
+    def __init__(self, parent, accounts):
+        super().__init__(parent)
+        self.dark_mode = getattr(parent, "dark_mode", False)
+        self.accounts = [dict(account) for account in accounts]
+        self.changed = False
+        self.setWindowTitle("管理选课人")
+        self.setMinimumSize(560, 420)
+        self.resize(max(560, min(760, int(parent.width() * 0.65))),
+                    max(420, min(620, int(parent.height() * 0.7))))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(14)
+        title = QLabel("管理选课人")
+        title.setObjectName("Title")
+        layout.addWidget(title)
+        description = QLabel("账号名称用于关联课程计划、Cookie 和待退课程。")
+        description.setObjectName("Muted")
+        layout.addWidget(description)
+        self.account_list = QListWidget()
+        self.account_list.setUniformItemSizes(True)
+        self.account_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.account_list.itemDoubleClicked.connect(lambda _item: self._edit_account())
+        layout.addWidget(self.account_list, 1)
+        actions = QHBoxLayout()
+        add_button = QPushButton("+ 添加")
+        add_button.setObjectName("Primary")
+        add_button.clicked.connect(self._add_account)
+        actions.addWidget(add_button)
+        edit_button = QPushButton("编辑")
+        edit_button.clicked.connect(self._edit_account)
+        actions.addWidget(edit_button)
+        delete_button = QPushButton("删除")
+        delete_button.clicked.connect(self._delete_account)
+        actions.addWidget(delete_button)
+        actions.addStretch()
+        close_button = QPushButton("完成")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        self._refresh()
+        self.setStyleSheet(workspace_style(self.dark_mode))
+
+    def _refresh(self, selected_row=None):
+        self.account_list.clear()
+        for account in self.accounts:
+            self.account_list.addItem(f"{account['name']}    ·    {account['username']}")
+        if self.accounts:
+            row = min(selected_row if selected_row is not None else 0, len(self.accounts) - 1)
+            self.account_list.setCurrentRow(max(0, row))
+
+    def _selected_row(self):
+        rows = sorted({index.row() for index in self.account_list.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "请选择选课人", "请先在列表中选择一个选课人。")
+            return None
+        if len(rows) > 1:
+            QMessageBox.information(self, "请选择一个选课人", "编辑时只能选择一个选课人。")
+            return None
+        return rows[0]
+
+    def _name_is_available(self, name, ignore_row=None):
+        return all(index == ignore_row or account["name"] != name
+                   for index, account in enumerate(self.accounts))
+
+    def _add_account(self):
+        dialog = AccountEditorDialog(self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        account = dialog.account()
+        if not self._name_is_available(account["name"]):
+            QMessageBox.warning(self, "名称重复", "选课人名称必须唯一。")
+            return
+        self.accounts.append(account)
+        save_accounts(self.accounts)
+        self.changed = True
+        self._refresh(len(self.accounts) - 1)
+
+    def _edit_account(self):
+        row = self._selected_row()
+        if row is None:
+            return
+        previous = self.accounts[row]
+        dialog = AccountEditorDialog(self, previous)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        account = dialog.account()
+        if not self._name_is_available(account["name"], ignore_row=row):
+            QMessageBox.warning(self, "名称重复", "选课人名称必须唯一。")
+            return
+        self.accounts[row] = account
+        save_accounts(self.accounts)
+        if previous["name"] != account["name"]:
+            self._rename_linked_data(previous["name"], account["name"])
+        self.changed = True
+        self._refresh(row)
+
+    def _rename_linked_data(self, old_name, new_name):
+        for loader, saver in ((load_courses, save_courses),
+                              (load_delete_courses, save_delete_courses),
+                              (load_cookies_dict, save_cookies_dict)):
+            data = loader()
+            if old_name in data:
+                data[new_name] = data.pop(old_name)
+                saver(data)
+
+    def _delete_account(self):
+        rows = sorted({index.row() for index in self.account_list.selectedIndexes()}, reverse=True)
+        if not rows:
+            QMessageBox.information(self, "请选择选课人", "请先在列表中选择要删除的选课人。")
+            return
+        selected_accounts = [self.accounts[row] for row in reversed(rows)]
+        account_names = [account["name"] for account in selected_accounts]
+        target = f"“{account_names[0]}”" if len(account_names) == 1 else f"选中的 {len(account_names)} 个选课人"
+        answer = QMessageBox.question(
+            self,
+            "删除选课人",
+            f"确定删除{target}吗？\n关联的课程计划和 Cookie 也会一并删除。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        for row in rows:
+            self.accounts.pop(row)
+        save_accounts(self.accounts)
+        for loader, saver in ((load_courses, save_courses),
+                              (load_delete_courses, save_delete_courses),
+                              (load_cookies_dict, save_cookies_dict)):
+            data = loader()
+            changed = False
+            for name in account_names:
+                if name in data:
+                    del data[name]
+                    changed = True
+            if changed:
+                saver(data)
+        self.changed = True
+        self._refresh(min(rows))
+
 
 # === 课程多选弹窗（捡漏模式） ===
 class SelectCoursesDialog(QDialog):
@@ -1112,90 +1228,31 @@ class SelectCoursesDialog(QDialog):
         return groups
 
     def _apply_style(self):
-        if self.dark_mode:
-            self.setStyleSheet("""
-                QDialog#SelectCoursesDialog {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #202040, stop:0.5 #1a1a2e, stop:1 #202060);
-                    color: white;
-                }
-                QLabel { color: white; }
-                QCheckBox {
-                    color: white; spacing: 10px;
-                    padding: 6px 8px; border-radius: 6px;
-                }
-                QCheckBox:hover { background: rgba(255,255,255,0.08); }
-                QCheckBox::indicator {
-                    width: 20px; height: 20px;
-                    border: 2px solid rgba(255,255,255,0.3);
-                    border-radius: 4px; background: transparent;
-                }
-                QCheckBox::indicator:checked {
-                    background: #4B0082; border-color: #6A5ACD;
-                }
-                QCheckBox::indicator:hover { border-color: rgba(255,255,255,0.6); }
-                QScrollArea { border: none; background: transparent; }
-                QPushButton#DialogOkBtn {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #4B0082, stop:1 #483D8B);
-                    color: white; border: none; border-radius: 6px;
-                    padding: 8px 16px;
-                }
-                QPushButton#DialogOkBtn:hover { background: #6A5ACD; }
-                QPushButton#DialogCancelBtn {
-                    background: rgba(255,255,255,0.1);
-                }
-                QPushButton#DialogCancelBtn:hover { background: rgba(255,255,255,0.2); }
-            """)
-        else:
-            self.setStyleSheet("""
-                QDialog#SelectCoursesDialog {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #F0F3F9, stop:0.5 #E6EAF0, stop:1 #DCE4F0);
-                    color: #202020;
-                }
-                QLabel { color: #202020; }
-                QCheckBox {
-                    color: #202020; spacing: 10px;
-                    padding: 6px 8px; border-radius: 6px;
-                }
-                QCheckBox:hover { background: rgba(0,0,0,0.03); }
-                QCheckBox::indicator {
-                    width: 20px; height: 20px;
-                    border: 2px solid rgba(0,0,0,0.2);
-                    border-radius: 4px; background: white;
-                }
-                QCheckBox::indicator:checked {
-                    background: #3B82F6; border-color: #2563EB;
-                }
-                QScrollArea { border: none; background: transparent; }
-                QPushButton#DialogOkBtn {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #3B82F6, stop:1 #2563EB);
-                    color: white; border: none; border-radius: 6px;
-                    padding: 8px 16px;
-                }
-                QPushButton#DialogOkBtn:hover { background: #2563EB; }
-                QPushButton#DialogCancelBtn {
-                    background: rgba(0,0,0,0.08);
-                }
-                QPushButton#DialogCancelBtn:hover { background: rgba(0,0,0,0.15); }
-            """)
+        self.setStyleSheet(workspace_style(self.dark_mode))
 
 class ProductionGlassmorphismUI(QMainWindow):
     """主界面类"""
     def __init__(self):
         super().__init__()
         self.setObjectName("MainWindow")
-        self.setWindowTitle("🎓 智能抢课系统 Pro (并发版)")
+        self.setWindowTitle("CourseSelect · 选课工作台")
         self.setGeometry(50, 50, 1200, 800)
-        self.setMinimumSize(1000, 700)
+        self.setMinimumSize(960, 700)
         
         self.workers = []
         self.pickup_workers = []
         self.upgrade_workers = []
         self.pre_work_thread = None
         self.is_running = False
+        self._managed_workers = set()
+        self._pending_workers = set()
+        self._stopping = False
+        self._closing = False
+        self.cookie_worker = None
+        self.query_panel = None
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(100)
+        self._close_timer.timeout.connect(self.close)
         self.request_interval = 1.0
         self.dark_mode = True
 
@@ -1220,6 +1277,7 @@ class ProductionGlassmorphismUI(QMainWindow):
                 with open("settings.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.push_token = data.get("push_token", "")
+                    self.dark_mode = data.get("dark_mode", True)
         except: pass
     def save_settings(self):
         try:
@@ -1228,6 +1286,7 @@ class ProductionGlassmorphismUI(QMainWindow):
                 with open("settings.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
             data["push_token"] = self.push_token
+            data["dark_mode"] = self.dark_mode
             with open("settings.json", "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
         except: pass
@@ -1236,29 +1295,19 @@ class ProductionGlassmorphismUI(QMainWindow):
         menubar = self.menuBar()
         menubar.setFont(QFont("Microsoft YaHei UI", 12))
         
-        file_menu = menubar.addMenu("📁 文件")
+        file_menu = menubar.addMenu("文件")
         file_menu.addAction("导入配置目录").triggered.connect(self.import_config_directory)
         file_menu.addSeparator()
         file_menu.addAction("退出").triggered.connect(self.close)
-        
-        edit_menu = menubar.addMenu("✏️ 编辑")
-        edit_menu.addAction("添加待选课程").triggered.connect(self.add_new_course)
-        edit_menu.addAction("添加待删除课程").triggered.connect(self.add_delete_course)
-        edit_menu.addSeparator()
-        edit_menu.addAction("新建选课人").triggered.connect(self.new_account_dialog)
-        
-        settings_menu = menubar.addMenu("⚙️ 设置")
-        settings_menu.addAction("更新 Cookie").triggered.connect(self.update_cookie_dialog)
-        settings_menu.addSeparator()
-        
-        settings_menu.addAction("🔥 启动捡漏模式").triggered.connect(self.start_pickup_mode_dialog)
-        settings_menu.addAction("🆙 升级课程").triggered.connect(self.upgrade_course_dialog)
 
+        settings_menu = menubar.addMenu("设置")
+        self.manage_accounts_action = settings_menu.addAction("管理选课人")
+        self.manage_accounts_action.triggered.connect(self.manage_accounts_dialog)
+        settings_menu.addSeparator()
         settings_menu.addAction("并发/查询间隔").triggered.connect(self.set_request_interval)
-        settings_menu.addAction("设置定时启动").triggered.connect(self.set_schedule_dialog)
         settings_menu.addAction("配置微信推送").triggered.connect(self.set_push_token_dialog)
         settings_menu.addSeparator()
-        self.theme_action = settings_menu.addAction("🌙 切换为浅色模式")
+        self.theme_action = settings_menu.addAction("切换为浅色模式" if self.dark_mode else "切换为深色模式")
         self.theme_action.triggered.connect(self.toggle_theme)
     
     def create_central_ui(self):
@@ -1266,224 +1315,267 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.central_widget.setObjectName("CentralWidget")
         self.setCentralWidget(self.central_widget)
         main_layout = QVBoxLayout(self.central_widget)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
-        self.title_label = QLabel("⚡ 智能抢课系统 Pro (并发版)")
-        self.title_label.setFont(QFont("Microsoft YaHei UI", 24, QFont.Bold))
-        self.title_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.title_label)
+        main_layout.setContentsMargins(28, 20, 28, 20)
+        main_layout.setSpacing(14)
+        heading = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        eyebrow = QLabel("COURSESELECT  /  WORKSPACE")
+        eyebrow.setObjectName("Eyebrow")
+        eyebrow.setFixedHeight(18)
+        titles.addWidget(eyebrow)
+        self.title_label = QLabel("选课工作台")
+        self.title_label.setObjectName("Title")
+        self.title_label.setFixedHeight(40)
+        titles.addWidget(self.title_label)
+        subtitle = QLabel("管理课程计划，随时掌握选课进度。")
+        subtitle.setObjectName("Muted")
+        subtitle.setFixedHeight(20)
+        titles.addWidget(subtitle)
+        heading.addLayout(titles)
+        heading.addStretch()
+        theme_button = QPushButton("切换外观")
+        theme_button.clicked.connect(self.toggle_theme)
+        heading.addWidget(theme_button)
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setObjectName("Status")
+        self.status_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        heading.addWidget(self.status_label)
+        main_layout.addLayout(heading)
         main_layout.addWidget(self._create_user_section())
+
+        metrics = QHBoxLayout()
+        self.metric_labels = []
+        self.metric_cards = []
+        for title, value, hint in (("待选课程", "0", "本次计划选入的课程"),
+                                   ("待退课程", "0", "启动后会先执行退课"),
+                                   ("请求间隔", "1.0 s", "可在设置中调整")):
+            card = QFrame()
+            card.setObjectName("Card")
+            box = QVBoxLayout(card)
+            box.setContentsMargins(18, 10, 18, 10)
+            box.setSpacing(3)
+            label = QLabel(title)
+            label.setObjectName("Muted")
+            box.addWidget(label)
+            number = QLabel(value)
+            number.setObjectName("Metric")
+            box.addWidget(number)
+            note = QLabel(hint)
+            note.setObjectName("Muted")
+            box.addWidget(note)
+            self.metric_labels.append(number)
+            self.metric_cards.append(card)
+            metrics.addWidget(card)
+        main_layout.addLayout(metrics)
+
         self.tabs = QTabWidget()
-        self.tabs.setFont(QFont("Microsoft YaHei UI", 12))
-        self.tabs.addTab(self._create_courses_tab(), "📋 课程管理")
-        self.tabs.addTab(self._create_logs_tab(), "📊 系统日志")
+        self.tabs.addTab(self._create_courses_tab(), "课程计划")
+        self.tabs.addTab(self._create_logs_tab(), "运行日志")
+        from course_query_ui import CourseQueryUI
+        self.query_panel = CourseQueryUI(
+            self,
+            embedded=True,
+            cookie_provider=self._current_query_cookie,
+            course_add_callback=self.add_course_from_query,
+        )
+        self.query_tab_index = self.tabs.addTab(self.query_panel, "开课查询")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         main_layout.addWidget(self.tabs, 1)
-        self.start_stop_button = QPushButton("🚀 开始并发选课")
-        self.start_stop_button.setFont(QFont("Microsoft YaHei UI", 16, QFont.Bold))
-        self.start_stop_button.setCursor(QCursor(Qt.PointingHandCursor))
-        self.start_stop_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.start_stop_button.setMinimumHeight(60)
+        footer = QHBoxLayout()
+        self.footer_hint = QLabel("核对课程计划后开始 · 定时启动与推送可在设置中配置")
+        self.footer_hint.setObjectName("Muted")
+        footer.addWidget(self.footer_hint, 1)
+        self.start_stop_button = QPushButton("开始选课")
+        self.start_stop_button.setObjectName("Primary")
+        self.start_stop_button.setMinimumSize(220, 48)
         self.start_stop_button.clicked.connect(self.toggle_selection)
-        main_layout.addWidget(self.start_stop_button)
-    
+        footer.addWidget(self.start_stop_button)
+        main_layout.addLayout(footer)
+        for button in self.central_widget.findChildren(QPushButton):
+            button.setCursor(QCursor(Qt.PointingHandCursor))
+
     def _create_user_section(self):
         frame = QFrame()
+        frame.setObjectName("Card")
         layout = QHBoxLayout(frame)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
-        label = QLabel("选择抢课人:")
-        label.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(14)
+        layout.addWidget(QLabel("当前账号"))
         self.user_combo = QComboBox()
-        self.user_combo.setFont(QFont("Microsoft YaHei UI", 12))
-        self.user_combo.setMinimumHeight(40)
+        self.user_combo.setMinimumWidth(180)
+        self.user_combo.setMinimumHeight(38)
         self.user_combo.currentTextChanged.connect(self.on_user_changed)
-        self.user_info_label = QLabel("")
-        self.user_info_label.setFont(QFont("Microsoft YaHei UI", 11))
-        layout.addWidget(label)
-        layout.addWidget(self.user_combo, 2)
-        layout.addWidget(self.user_info_label, 2)
-        layout.addStretch()
+        layout.addWidget(self.user_combo, 1)
+        self.add_account_button = QPushButton("+")
+        self.add_account_button.setToolTip("添加选课人")
+        self.add_account_button.setAccessibleName("添加选课人")
+        self.add_account_button.setFixedSize(38, 38)
+        self.add_account_button.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        self.add_account_button.clicked.connect(self.new_account_dialog)
+        layout.addWidget(self.add_account_button)
+        self.user_info_label = QLabel("选择账号以查看课程计划")
+        self.user_info_label.setObjectName("Muted")
+        layout.addWidget(self.user_info_label, 1)
+        self.cookie_button = QPushButton("更新 Cookie")
+        self.cookie_button.clicked.connect(self.update_cookie_dialog)
+        layout.addWidget(self.cookie_button)
+        query_button = QPushButton("查询开课数据")
+        query_button.clicked.connect(self.open_course_query)
+        layout.addWidget(query_button)
         return frame
-    
+
     def _create_courses_tab(self):
         widget = QWidget()
-        layout = QGridLayout(widget)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(20)
-        left_frame = QFrame()
-        left_layout = QVBoxLayout(left_frame)
-        left_layout.addWidget(QLabel("📌 待选课程 (每门课一个线程)"))
-        self.course_list = QListWidget()
-        self.course_list.setFont(QFont("Microsoft YaHei UI", 12))
-        left_layout.addWidget(self.course_list)
-        layout.addWidget(left_frame, 0, 0)
-        right_frame = QFrame()
-        right_layout = QVBoxLayout(right_frame)
-        right_layout.addWidget(QLabel("🗑️ 待删除课程 (启动前优先执行)"))
-        self.delete_course_list = QListWidget()
-        self.delete_course_list.setFont(QFont("Microsoft YaHei UI", 12))
-        right_layout.addWidget(self.delete_course_list)
-        layout.addWidget(right_frame, 0, 1)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 12, 0, 0)
+        columns = QHBoxLayout()
+        for title, hint, attr, callback in (
+            ("待选课程", "添加课程编号；选择后按 Delete 删除", "course_list", self.add_new_course),
+            ("待退课程", "启动前优先退选；选择后按 Delete 删除", "delete_course_list", self.add_delete_course),
+        ):
+            card = QFrame()
+            card.setObjectName("Card")
+            box = QVBoxLayout(card)
+            box.setContentsMargins(16, 14, 16, 14)
+            row = QHBoxLayout()
+            row.addWidget(QLabel(title), 1)
+            add = QPushButton("+ 添加课程")
+            add.setMinimumHeight(36)
+            add.clicked.connect(callback)
+            row.addWidget(add)
+            box.addLayout(row)
+            note = QLabel(hint)
+            note.setObjectName("Muted")
+            box.addWidget(note)
+            view = DeletableListWidget()
+            view.setMinimumHeight(70)
+            view.setUniformItemSizes(True)
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            view.setToolTip("选择课程后按 Delete 删除")
+            setattr(self, attr, view)
+            if attr == "course_list":
+                view.delete_requested.connect(self.delete_selected_courses)
+            else:
+                view.delete_requested.connect(self.delete_selected_drop_courses)
+            box.addWidget(view, 1)
+            empty = QLabel("暂无课程 · 点击上方添加")
+            empty.setObjectName("Muted")
+            empty.setAlignment(Qt.AlignCenter)
+            setattr(self, attr + "_empty", empty)
+            box.addWidget(empty)
+            columns.addWidget(card)
+        layout.addLayout(columns, 1)
+        actions = QHBoxLayout()
+        self.task_buttons = []
+        for text, callback in (("捡漏监控", self.start_pickup_mode_dialog),
+                               ("升级课程", self.upgrade_course_dialog),
+                               ("定时启动", self.set_schedule_dialog)):
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            actions.addWidget(button)
+            self.task_buttons.append(button)
+        actions.addStretch()
+        layout.addLayout(actions)
         return widget
-    
+
     def _create_logs_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(15, 15, 15, 15)
-        self.log_display = QTextEdit()
-        self.log_display.setReadOnly(True)
-        self.log_display.setFont(QFont("Consolas", 12))
+        layout.setContentsMargins(0, 12, 0, 0)
+        row = QHBoxLayout()
+        note = QLabel("保留最近 3,000 行 · 向上滚动可暂停自动跟随")
+        note.setObjectName("Muted")
+        row.addWidget(note, 1)
+        clear = QPushButton("清空日志")
+        row.addWidget(clear)
+        layout.addLayout(row)
+        self.log_display = BufferedLogView()
+        self.log_display.setFont(QFont("Consolas", 10))
+        clear.clicked.connect(self.log_display.clear)
         layout.addWidget(self.log_display)
         return widget
 
+    def open_course_query(self):
+        self.tabs.setCurrentIndex(self.query_tab_index)
+
+    def _current_query_cookie(self):
+        user = self.user_combo.currentText()
+        if not user:
+            return "", ""
+        return user, load_cookies_dict().get(user, "")
+
+    def add_course_from_query(self, course_id):
+        user = self.user_combo.currentText()
+        if not user:
+            QMessageBox.warning(self, "未选择账号", "请先在工作台选择一个账号。")
+            return False
+        courses = load_courses()
+        user_courses = courses.setdefault(user, [])
+        if course_id in user_courses:
+            QMessageBox.information(self, "课程已存在", "这门课程已经在待选计划中。")
+            return False
+        user_courses.append(course_id)
+        save_courses(courses)
+        self.on_user_changed(user)
+        self.log_display.append(f"已从开课查询加入待选课程：{course_id}")
+        return True
+
+    def _on_tab_changed(self, index):
+        show_selection = index != self.query_tab_index
+        for card in self.metric_cards:
+            card.setVisible(show_selection)
+        self.footer_hint.setVisible(show_selection)
+        self.start_stop_button.setVisible(show_selection)
+
     def apply_glassmorphism_style(self):
-        if self.dark_mode:
-            colors = {
-                'bg_start': '#202040', 'bg_mid': '#1a1a2e', 'bg_end': '#202060',
-                'text_main': '#FFFFFF', 'card_bg': 'rgba(255, 255, 255, 0.08)',
-                'card_border': 'rgba(255, 255, 255, 0.15)', 'input_bg': 'rgba(0, 0, 0, 0.2)',
-                'menu_bg': '#202040', 'menu_hover': 'rgba(0, 198, 255, 0.2)',
-                'list_item_bg': 'rgba(255, 255, 255, 0.05)', 'list_item_sel': 'rgba(0, 198, 255, 0.3)',
-                'btn_bg_1': '#4B0082', 'btn_bg_2': '#483D8B', 'btn_hover': '#6A5ACD'
-            }
-        else:
-            colors = {
-                'bg_start': '#F0F3F9', 'bg_mid': '#E6EAF0', 'bg_end': '#DCE4F0',
-                'text_main': '#202020', 'card_bg': 'rgba(255, 255, 255, 0.75)',
-                'card_border': 'rgba(0, 0, 0, 0.08)', 'input_bg': '#FFFFFF',
-                'menu_bg': '#F9FAFB', 'menu_hover': 'rgba(59, 130, 246, 0.1)',
-                'list_item_bg': '#FFFFFF', 'list_item_sel': 'rgba(59, 130, 246, 0.2)',
-                'btn_bg_1': '#3B82F6', 'btn_bg_2': '#2563EB', 'btn_hover': '#6A5ACD'
-            }
+        self.setStyleSheet(workspace_style(self.dark_mode))
+        if self.query_panel is not None:
+            self.query_panel.set_dark_mode(self.dark_mode)
+        self._update_run_state()
 
-        if self.is_running:
-            btn_style = """
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #FF4444, stop:1 #CC0000);
-                color: #FFFFFF; border: none; border-radius: 12px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #FF6666; }
-            """
-        else:
-            btn_style = f"""
-            QPushButton {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {colors['btn_bg_1']}, stop:1 {colors['btn_bg_2']});
-                color: #FFFFFF; border: none; border-radius: 12px; font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: {colors['btn_hover']}; }}
-            """
-
-        qss = f"""
-        QMainWindow#MainWindow {{
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {colors['bg_start']}, stop:0.5 {colors['bg_mid']}, stop:1 {colors['bg_end']});
-        }}
-        QWidget#CentralWidget {{ background: transparent; }}
-        QWidget {{ color: {colors['text_main']}; font-family: "Microsoft YaHei UI", sans-serif; }}
-        QFrame {{ background-color: {colors['card_bg']}; border: 1px solid {colors['card_border']}; border-radius: 12px; }}
-        QMenuBar {{ background-color: {colors['menu_bg']}; border-bottom: 1px solid {colors['card_border']}; }}
-        QMenuBar::item {{ background: transparent; padding: 5px 10px; }}
-        QMenuBar::item:selected {{ background-color: {colors['menu_hover']}; border-radius: 4px; }}
-        QMenu {{ background-color: {colors['menu_bg']}; border: 1px solid {colors['card_border']}; padding: 5px; }}
-        QMenu::item:selected {{ background-color: {colors['menu_hover']}; border-radius: 4px; }}
-        QLineEdit, QTextEdit, QComboBox {{ background-color: {colors['input_bg']}; border: 1px solid {colors['card_border']}; border-radius: 6px; padding: 5px; selection-background-color: {colors['btn_bg_1']}; }}
-        QComboBox::drop-down {{ border: none; width: 20px; }}
-        QComboBox QAbstractItemView {{
-            background-color: {colors['menu_bg']};
-            color: {colors['text_main']};
-            selection-background-color: {colors['btn_bg_1']};
-            selection-color: #FFFFFF;
-            border: 1px solid {colors['card_border']};
-            outline: none;
-        }}
-        QListWidget {{ background-color: {colors['input_bg']}; border: 1px solid {colors['card_border']}; border-radius: 8px; outline: none; }}
-        QListWidget::item {{ background-color: {colors['list_item_bg']}; border-radius: 6px; margin: 2px; padding: 8px; color: {colors['text_main']}; }}
-        QListWidget::item:selected {{ background-color: {colors['list_item_sel']}; border: 1px solid {colors['btn_bg_1']}; }}
-        QTabWidget::pane {{ border: none; background: transparent; }}
-        QTabBar::tab {{ background: {colors['card_bg']}; color: {colors['text_main']}; padding: 8px 20px; margin-right: 4px; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
-        QTabBar::tab:selected {{ background: {colors['btn_bg_1']}; color: #FFFFFF; }}
-        QMessageBox {{
-            background-color: {colors['bg_mid']};
-            color: {colors['text_main']};
-        }}
-        QMessageBox QLabel {{
-            color: {colors['text_main']};
-            font-size: 13px;
-        }}
-        QMessageBox QPushButton {{
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                stop:0 {colors['btn_bg_1']}, stop:1 {colors['btn_bg_2']});
-            color: #FFFFFF;
-            border: none;
-            border-radius: 6px;
-            padding: 8px 24px;
-            font-weight: bold;
-            min-width: 80px;
-            min-height: 30px;
-        }}
-        QMessageBox QPushButton:hover {{
-            background-color: {colors['btn_hover']};
-        }}
-        QInputDialog {{
-            background-color: {colors['bg_mid']};
-            color: {colors['text_main']};
-        }}
-        QInputDialog QLabel {{
-            color: {colors['text_main']};
-            font-size: 13px;
-        }}
-        QInputDialog QLineEdit {{
-            background-color: {colors['input_bg']};
-            color: {colors['text_main']};
-            border: 1px solid {colors['card_border']};
-            border-radius: 6px;
-            padding: 6px 10px;
-            font-size: 13px;
-        }}
-        QInputDialog QPushButton {{
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                stop:0 {colors['btn_bg_1']}, stop:1 {colors['btn_bg_2']});
-            color: #FFFFFF;
-            border: none;
-            border-radius: 6px;
-            padding: 8px 24px;
-            font-weight: bold;
-            min-width: 80px;
-            min-height: 30px;
-        }}
-        QInputDialog QPushButton:hover {{
-            background-color: {colors['btn_hover']};
-        }}
-        QInputDialog QComboBox {{
-            background-color: {colors['input_bg']};
-            color: {colors['text_main']};
-            border: 1px solid {colors['card_border']};
-            border-radius: 6px;
-            padding: 4px 8px;
-        }}
-        QInputDialog QComboBox::drop-down {{ border: none; width: 20px; }}
-        QInputDialog QComboBox QAbstractItemView {{
-            background-color: {colors['input_bg']};
-            color: {colors['text_main']};
-            selection-background-color: {colors['btn_bg_1']};
-        }}
-        {btn_style}
-        """
-        self.setStyleSheet(qss)
+    def _update_run_state(self):
+        stopping = self._stopping or self._closing
+        self.start_stop_button.setProperty("running", self.is_running)
+        self.start_stop_button.setText("正在停止…" if stopping else
+                                       "停止所有任务" if self.is_running else "开始选课")
+        self.start_stop_button.setEnabled(not stopping and bool(self.user_combo.currentText()))
+        self.user_combo.setEnabled(not self.is_running and not stopping)
+        account_editable = not self.is_running and not stopping and self.cookie_worker is None
+        self.add_account_button.setEnabled(account_editable)
+        self.manage_accounts_action.setEnabled(account_editable)
+        self.cookie_button.setEnabled(account_editable)
+        self.course_list.setEnabled(not self.is_running and not stopping)
+        self.delete_course_list.setEnabled(not self.is_running and not stopping)
+        for button in self.task_buttons:
+            button.setEnabled(not self.is_running and not stopping)
+        self.status_label.setText("正在停止" if stopping else "任务运行中" if self.is_running else "准备就绪")
+        self.start_stop_button.style().unpolish(self.start_stop_button)
+        self.start_stop_button.style().polish(self.start_stop_button)
 
     def load_initial_data(self):
         try:
+            current_user = self.user_combo.currentText()
             accounts = load_accounts()
             self.user_combo.blockSignals(True)
             self.user_combo.clear()
             self.user_combo.addItem("")
             for acc in accounts:
                 self.user_combo.addItem(acc["name"])
+            if current_user:
+                index = self.user_combo.findText(current_user)
+                if index >= 0:
+                    self.user_combo.setCurrentIndex(index)
             self.user_combo.blockSignals(False)
             self.log_display.append("✓ 系统就绪")
+            self.on_user_changed(self.user_combo.currentText())
         except: pass
 
     def on_user_changed(self, username):
-        if not username: return
+        self.course_list.clear()
+        self.delete_course_list.clear()
+        self.user_info_label.setText("选择账号以查看课程计划")
         try:
             accs = load_accounts()
             u = next((a for a in accs if a['name'] == username), None)
@@ -1496,7 +1588,13 @@ class ProductionGlassmorphismUI(QMainWindow):
             self.delete_course_list.clear()
             for c in d_data.get(username, []):
                 self.delete_course_list.addItem(f"{c['courseCode']} (班序:{c['classNo']})")
-        except: pass
+        except Exception as exc:
+            self.log_display.append(f"读取课程计划失败: {exc}")
+        self.metric_labels[0].setText(str(self.course_list.count()))
+        self.metric_labels[1].setText(str(self.delete_course_list.count()))
+        self.course_list_empty.setVisible(self.course_list.count() == 0)
+        self.delete_course_list_empty.setVisible(self.delete_course_list.count() == 0)
+        self._update_run_state()
 
     def import_config_directory(self):
         path = QFileDialog.getExistingDirectory(self, "选择配置目录")
@@ -1545,16 +1643,65 @@ class ProductionGlassmorphismUI(QMainWindow):
             except Exception as e: self.log_display.append(str(e))
 
     def new_account_dialog(self):
-        name, ok1 = self._get_text_input("新建", "名称:")
-        uid, ok2 = self._get_text_input("新建", "学号:")
-        pwd, ok3 = self._get_text_input("新建", "密码:")
-        if ok1 and ok2 and ok3:
-            try:
-                accs = load_accounts()
-                accs.append({'name': name, 'username': uid, 'password': pwd})
-                save_accounts(accs)
-                self.load_initial_data()
-            except: pass
+        if self.is_running or self.cookie_worker is not None:
+            return
+        dialog = AccountEditorDialog(self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        account = dialog.account()
+        accounts = load_accounts()
+        if any(item["name"] == account["name"] for item in accounts):
+            QMessageBox.warning(self, "名称重复", "选课人名称必须唯一。")
+            return
+        accounts.append(account)
+        save_accounts(accounts)
+        self.load_initial_data()
+        self.user_combo.setCurrentText(account["name"])
+
+    def manage_accounts_dialog(self):
+        if self.is_running or self.cookie_worker is not None:
+            return
+        dialog = ManageAccountsDialog(self, load_accounts())
+        dialog.exec_()
+        if dialog.changed:
+            self.load_initial_data()
+
+    def delete_selected_courses(self):
+        self._delete_selected_plan_rows(self.course_list, is_drop=False)
+
+    def delete_selected_drop_courses(self):
+        self._delete_selected_plan_rows(self.delete_course_list, is_drop=True)
+
+    def _delete_selected_plan_rows(self, widget, is_drop):
+        if self.is_running or self._stopping:
+            return
+        user = self.user_combo.currentText()
+        rows = sorted({index.row() for index in widget.selectedIndexes()}, reverse=True)
+        if not user or not rows:
+            return
+        kind = "待退课程" if is_drop else "待选课程"
+        answer = QMessageBox.question(
+            self,
+            f"删除{kind}",
+            f"确定从计划中删除选中的 {len(rows)} 门课程吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        loader = load_delete_courses if is_drop else load_courses
+        saver = save_delete_courses if is_drop else save_courses
+        data = loader()
+        planned = data.get(user, [])
+        removed = 0
+        for row in rows:
+            if 0 <= row < len(planned):
+                planned.pop(row)
+                removed += 1
+        data[user] = planned
+        saver(data)
+        self.on_user_changed(user)
+        self.log_display.append(f"已从{kind}中删除 {removed} 项")
     
     def check_schedule(self):
         if self.scheduled_time and not self.is_running and not self.scheduled_triggered:
@@ -1608,6 +1755,8 @@ class ProductionGlassmorphismUI(QMainWindow):
 
     def update_cookie_dialog(self):
         """弹出账号多选窗口，为选中的账号依次获取 Cookie"""
+        if self.cookie_worker is not None or self._closing:
+            return
         accounts = load_accounts()
         if not accounts:
             QMessageBox.warning(self, "错误", "没有账号数据，请先新建选课人")
@@ -1622,56 +1771,40 @@ class ProductionGlassmorphismUI(QMainWindow):
             QMessageBox.information(self, "提示", "未选择任何账号")
             return
 
-        self.log_display.append(f"--- 开始批量获取 Cookie (CAS HTTP+RSA) ---")
-        self.log_display.append(f"📋 共 {len(selected)} 个账号需要更新")
+        self.cookie_worker = CookieUpdateWorker(selected, self)
+        self._update_run_state()
+        self.tabs.setCurrentIndex(1)
+        self.log_display.append(f"开始更新 {len(selected)} 个账号的 Cookie…")
+        self.cookie_worker.log_signal.connect(self.log_display.append)
+        self.cookie_worker.result_signal.connect(
+            lambda ok, failed: self.log_display.append(f"Cookie 更新完成：成功 {ok}，失败 {failed}"))
+        self.cookie_worker.finished.connect(self._cookie_update_finished)
+        self.cookie_worker.start()
 
-        success_count = 0
-        fail_count = 0
-        all_cookies = load_cookies_dict()
-
-        for i, acc in enumerate(selected, 1):
-            name = acc["name"]
-            uid = acc["username"]
-            pwd = acc["password"]
-
-            self.log_display.append(f"\n[{i}/{len(selected)}] 正在处理: {name} ({uid})")
-
-            try:
-                cookies_list = get_cookies(
-                    uid, pwd,
-                    report_callback=self.log_display.append,
-                )
-                if cookies_list:
-                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
-                    all_cookies[name] = cookie_str
-                    save_cookies_dict(all_cookies)
-                    self.log_display.append(f"✅ [{name}] Cookie 保存成功！")
-                    success_count += 1
-                else:
-                    self.log_display.append(f"⚠️ [{name}] Cookie 获取失败（返回为空）")
-                    fail_count += 1
-            except Exception as e:
-                self.log_display.append(f"❌ [{name}] 异常: {e}")
-                fail_count += 1
-
-        # 汇总
-        self.log_display.append(f"\n{'='*40}")
-        self.log_display.append(f"📊 批量更新完成: 成功 {success_count}，失败 {fail_count}，共 {len(selected)}")
-        if fail_count == 0 and success_count > 0:
-            QMessageBox.information(self, "完成", f"全部 {success_count} 个账号 Cookie 更新成功！")
-        elif fail_count > 0:
-            QMessageBox.warning(self, "完成", f"成功 {success_count} 个，失败 {fail_count} 个。请查看日志。")
+    def _cookie_update_finished(self):
+        self.cookie_worker.deleteLater()
+        self.cookie_worker = None
+        self._update_run_state()
+        self.on_user_changed(self.user_combo.currentText())
+        if self._closing:
+            QTimer.singleShot(0, self.close)
 
     def set_request_interval(self):
         s, ok = self._get_text_input("设置", "并发间隔(秒):")
         if ok:
             try:
                 val = float(s)
+                if not math.isfinite(val) or val <= 0:
+                    raise ValueError("间隔必须是大于 0 的有限数值")
                 self.request_interval = val
-            except: pass
+                self.metric_labels[2].setText(f"{val:g} s")
+            except ValueError:
+                QMessageBox.warning(self, "输入无效", "请输入大于 0 的有效秒数。")
 
     # === 关键修正: 统一的启动/停止逻辑 ===
     def toggle_selection(self):
+        if self._stopping or self._closing:
+            return
         # 如果正在运行（无论是普通抢课还是捡漏监控），都调用停止
         if self.is_running or self.pickup_workers:
             self.stop_selection()
@@ -1679,11 +1812,12 @@ class ProductionGlassmorphismUI(QMainWindow):
             self.start_selection()
 
     def start_selection(self):
+        if self.is_running or self._stopping or self._closing:
+            return
         u = self.user_combo.currentText()
         if not u: return
         self.is_running = True
-        self.start_stop_button.setText("⏹️  停止并发抢课")
-        self.apply_glassmorphism_style()
+        self._update_run_state()
         self.tabs.setCurrentIndex(1)
         
         d_courses = load_delete_courses().get(u, [])
@@ -1695,8 +1829,8 @@ class ProductionGlassmorphismUI(QMainWindow):
 
         self.pre_work_thread = PreWorkThread(cookies, d_courses)
         self.pre_work_thread.log_signal.connect(self.log_display.append)
-        self.pre_work_thread.finished_signal.connect(lambda: self.launch_concurrent_workers(u, cookies))
-        self.pre_work_thread.start()
+        self.pre_work_thread.finished.connect(lambda: self.launch_concurrent_workers(u, cookies))
+        self._queue_worker(self.pre_work_thread)
 
     def launch_concurrent_workers(self, u, cookies):
         if not self.is_running: return
@@ -1707,47 +1841,68 @@ class ProductionGlassmorphismUI(QMainWindow):
             return
         self.log_display.append(f"🚀 启动并发引擎: {len(courses)} 个线程并行处理...")
         self.workers = []
-        for cid in courses:
+        for index, cid in enumerate(courses):
             worker = SingleCourseWorker(cookies, cid, u, self.request_interval, self.push_token)
             worker.log_signal.connect(self.log_display.append)
             worker.success_signal.connect(self.highlight_successful_courses)
             worker.finished_signal.connect(self.on_worker_finished)
             worker.captcha_signal.connect(lambda w=worker: self.show_captcha_dialog(w))
             self.workers.append(worker)
-            worker.start()
-            QThread.msleep(100)
+            self._queue_worker(worker, index * 100)
 
-    # === 关键修正: 停止所有类型的线程并复位UI ===
+    def _queue_worker(self, worker, delay=0):
+        # Keep running and scheduled threads alive until they actually finish.
+        worker.setParent(self)
+        self._managed_workers.add(worker)
+        self._pending_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._release_worker(w))
+        QTimer.singleShot(delay, lambda w=worker: self._start_queued_worker(w))
+
+    def _start_queued_worker(self, worker):
+        if worker not in self._pending_workers:
+            return
+        self._pending_workers.remove(worker)
+        if self.is_running and not self._closing:
+            worker.start()
+        else:
+            self._release_worker(worker)
+
+    def _release_worker(self, worker):
+        self._managed_workers.discard(worker)
+        self._pending_workers.discard(worker)
+        for group in (self.workers, self.pickup_workers, self.upgrade_workers):
+            if worker in group:
+                group.remove(worker)
+        if self.pre_work_thread is worker:
+            self.pre_work_thread = None
+        worker.deleteLater()
+        QTimer.singleShot(0, self._finish_selection_if_idle)
+
+    def _finish_selection_if_idle(self):
+        if self._managed_workers:
+            return
+        was_active = self.is_running or self._stopping
+        self.is_running = False
+        self._stopping = False
+        self._update_run_state()
+        if was_active:
+            self.log_display.append("✓ 所有任务已结束")
+        if self._closing:
+            self.close()
+
     def stop_selection(self):
         self.is_running = False
-        self.log_display.append("⏹️ 正在停止所有线程...")
-
-        # 1. 停止普通并发线程（非阻塞停止，验证码等待会自动中断）
-        if self.pre_work_thread and self.pre_work_thread.isRunning():
-            self.pre_work_thread.terminate()
-        for w in self.workers:
-            if w.isRunning():
-                w.stop()
-        self.workers.clear()
-
-        # 2. 停止捡漏线程
-        for w in self.pickup_workers:
-            if w.isRunning():
-                w.stop()
-        self.pickup_workers.clear()
-
-        # 2.5 停止升级线程
-        for w in self.upgrade_workers:
-            if w.isRunning():
-                w.stop()
-        self.upgrade_workers.clear()
-
-        # 3. 复位按钮和样式
-        self.start_stop_button.setText("🚀 开始并发选课")
-        self.apply_glassmorphism_style()
-        self.log_display.append("✅ 所有操作已停止")
+        self._stopping = bool(self._managed_workers)
+        self.log_display.append("正在停止任务，等待当前请求结束…")
+        for worker in tuple(self._managed_workers):
+            worker.stop()
+            if worker in self._pending_workers:
+                self._release_worker(worker)
+        self._update_run_state()
+        self._finish_selection_if_idle()
 
     def on_worker_finished(self, course_id):
+        # QThread.finished handles lifecycle after run() and cleanup return.
         pass
 
     def highlight_successful_courses(self, course_id):
@@ -1761,6 +1916,9 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.dark_mode = not self.dark_mode
         self.theme_action.setText("🌙 切换为浅色模式" if self.dark_mode else "🌙 切换为深色模式")
         self.apply_glassmorphism_style()
+        self.save_settings()
+        if self.query_panel is not None:
+            self.query_panel.set_dark_mode(self.dark_mode)
         self.log_display.append("✓ 主题已切换")
 
     def _get_text_input(self, title, prompt, is_multiline=False):
@@ -1771,16 +1929,44 @@ class ProductionGlassmorphismUI(QMainWindow):
 
     def show_captcha_dialog(self, worker):
         """显示验证码输入弹窗，用户输入后通知等待中的工作线程"""
+        if not self.is_running or not worker.is_running or self._closing:
+            return
         course_label = getattr(worker, 'course_id', None) or getattr(worker, 'course_code', '')
         dialog = CaptchaDialog(self, worker.cookies, caption=course_label)
+        stop_timer = QTimer(dialog)
+        stop_timer.timeout.connect(lambda: dialog.reject() if not worker.is_running or self._closing else None)
+        stop_timer.start(200)
         if dialog.exec_() == QDialog.Accepted:
             worker.captcha_code = dialog.get_value()
         else:
             worker.captcha_code = "1234"  # 取消则用默认值
         worker.captcha_event.set()
+        stop_timer.stop()
+        dialog.deleteLater()
     
     def closeEvent(self, event):
-        if self.is_running: self.stop_selection()
+        cookie_busy = self.cookie_worker is not None and self.cookie_worker.isRunning()
+        query_busy = (self.query_panel is not None and self.query_panel.fetch_thread is not None
+                      and self.query_panel.fetch_thread.isRunning())
+        captcha_dialogs = self.findChildren(CaptchaDialog)
+        captcha_busy = any(dialog.image_worker is not None for dialog in captcha_dialogs)
+        if self._managed_workers or cookie_busy or query_busy or captcha_busy:
+            event.ignore()
+            self._closing = True
+            self.schedule_timer.stop()
+            self._close_timer.start()
+            if self.cookie_worker is not None:
+                self.cookie_worker.stop()
+            if query_busy:
+                self.query_panel.fetch_thread.stop()
+            for dialog in captcha_dialogs:
+                dialog.reject()
+            if self.is_running:
+                self.stop_selection()
+            self._update_run_state()
+            return
+        self._close_timer.stop()
+        self.log_display.flush()
         event.accept()
 
     PICKUP_DATA_FILE = "courses_full.json"
@@ -1788,12 +1974,12 @@ class ProductionGlassmorphismUI(QMainWindow):
     def _load_pickup_course_map(self):
         """从 courses_full.json 加载 cttId → kcbh 映射及课程名称"""
         if not os.path.exists(self.PICKUP_DATA_FILE):
-            return {}, {}
+            return {}
         try:
             with open(self.PICKUP_DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except:
-            return {}, {}
+            return {}
         ctt_to_kcbh = {}   # cttId → {kcbh, kcmc}
         for course in data.get("courses", []):
             kcbh = course.get("kcbh", "")
@@ -1808,6 +1994,8 @@ class ProductionGlassmorphismUI(QMainWindow):
         return ctt_to_kcbh
 
     def start_pickup_mode_dialog(self):
+        if self.is_running or self._stopping or self._closing:
+            return
         u = self.user_combo.currentText()
         if not u:
             QMessageBox.warning(self, "错误", "请先选择一个抢课人")
@@ -1866,7 +2054,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.log_display.append(f"🚀 正在为 [{u}] 启动智能捡漏模式...")
         self.log_display.append(f"📊 已选择 {len(selected)} 门课程，启动监控线程：")
 
-        for kcbh in sorted(selected.keys()):
+        for index, kcbh in enumerate(sorted(selected.keys())):
             group = selected[kcbh]
             self.log_display.append(f"  🔍 [{kcbh}] {group['kcmc']} ({len(group['cttIds'])} 个班级)")
 
@@ -1882,14 +2070,15 @@ class ProductionGlassmorphismUI(QMainWindow):
             worker.success_signal.connect(self.highlight_successful_courses)
             worker.captcha_signal.connect(lambda w=worker: self.show_captcha_dialog(w))
             self.pickup_workers.append(worker)
-            worker.start()
-            QThread.msleep(500)
+            self._queue_worker(worker, index * 500)
 
-        self.start_stop_button.setText(f"⏹️ 停止监控 ({len(selected)} 线程)")
+        self._update_run_state()
         self.log_display.append(f"✅ 捡漏监控已启动，共 {len(selected)} 个线程")
 
     def upgrade_course_dialog(self):
         """升级课程：输入当前已选课程 cttId 和目标课程 cttId"""
+        if self.is_running or self._stopping or self._closing:
+            return
         u = self.user_combo.currentText()
         if not u:
             QMessageBox.warning(self, "错误", "请先选择一个抢课人")
@@ -1965,7 +2154,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         worker.success_signal.connect(lambda msg: self.log_display.append(f"🎉 {msg}"))
         worker.captcha_signal.connect(lambda w=worker: self.show_captcha_dialog(w))
         self.upgrade_workers.append(worker)
-        worker.start()
+        self._queue_worker(worker)
 
         self.log_display.append(f"\n{'='*45}")
         self.log_display.append(f"🆙 升级监控已启动")

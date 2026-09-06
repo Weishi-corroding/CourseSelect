@@ -17,18 +17,21 @@ import time
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
+    QTableView, QHeaderView, QFrame,
     QSizePolicy, QStatusBar, QAbstractItemView, QGroupBox,
     QGridLayout, QMessageBox, QFileDialog, QSplitter,
     QInputDialog, QAction, QDialog, QProgressBar, QTextEdit,
 )
 from PyQt5.QtGui import QFont, QColor, QBrush, QCursor
-from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
+from course_table_model import CourseTableModel
+from ui_support import workspace_style, InterruptibleThread
+from functools import lru_cache
 
 # ── 抓取课程线程 ─────────────────────────────────────────────────────
 from fetch_courses import (
     fetch_course_list, fetch_course_timetable, load_cookies_dict,
-    _common_headers, SessionExpired,
+    cleanup_fetch_session, _parse_timetable_html, SessionExpired,
 )
 # 自动重新登录依赖
 from core import get_cookies, load_accounts, save_cookies_dict
@@ -37,7 +40,7 @@ from core import get_cookies, load_accounts, save_cookies_dict
 AUTO_RELOGIN_ACCOUNT_NAME = "卫宁远"
 
 
-class FetchCoursesThread(QThread):
+class FetchCoursesThread(InterruptibleThread):
     """后台抓取课程，完成后自动保存到 courses_full.json"""
     progress = pyqtSignal(str)
     progress_step = pyqtSignal(int, int, str)  # (current_1based, total, label)；total=0 表示忙碌/不确定
@@ -55,6 +58,7 @@ class FetchCoursesThread(QThread):
     def stop(self):
         """请求中断抓取；run() 主循环每次迭代检查此标志"""
         self._stop_requested = True
+        super().stop()
 
     # ── 自动重新登录 ─────────────────────────────────────────────────
     def _relogin(self):
@@ -118,7 +122,10 @@ class FetchCoursesThread(QThread):
                 fetch_course_list, term_id=self.term_id,
             )
             if not courses:
-                self.error_signal.emit("❌ 获取课程列表失败（返回为空）")
+                self.error_signal.emit(
+                    "获取课程列表失败。\n\n"
+                    "请先在选课工作台更新 Cookie 后重试；详细原因已写入运行日志。"
+                )
                 return
 
             # 标准化字段
@@ -170,7 +177,7 @@ class FetchCoursesThread(QThread):
             results = []
             cancelled = False
             for i, course in enumerate(normalized):
-                if self._stop_requested:
+                if self._stop_requested or not self.is_running:
                     cancelled = True
                     self.progress.emit("⏹ 用户已取消抓取，停止后续请求")
                     break
@@ -189,7 +196,7 @@ class FetchCoursesThread(QThread):
                 if i < total - 1:
                     self.msleep(300)
 
-            if cancelled:
+            if cancelled or not self.is_running:
                 # 取消时不写文件、不发 finished_signal；仅作为 error_signal 路径之外的中性结束
                 self.error_signal.emit("⏹ 抓取已取消（未写入 courses_full.json）")
                 return
@@ -215,6 +222,8 @@ class FetchCoursesThread(QThread):
 
         except Exception as e:
             self.error_signal.emit(f"❌ 抓取异常: {e}")
+        finally:
+            cleanup_fetch_session()
 
     def _build_ctt_map(self):
         """从现有的 courses_full.json 构建 cttId → kcbh 映射"""
@@ -504,6 +513,7 @@ def load_courses(filepath):
         return json.load(f)
 
 
+@lru_cache(maxsize=2048)
 def parse_time_slot(text):
     """解析 "周五.5.6.7节" → (day=5, periods=[5,6,7])"""
     m = re.match(r"周([一二三四五六日])\.([\d.]+)节", text.strip())
@@ -514,24 +524,28 @@ def parse_time_slot(text):
     return day, periods
 
 
-def detect_campus(classroom):
-    """根据教室名判断校区（兜底法：仅在 suggested_major 不可用时使用）。
-
-    DHU 主要两个校区命名约定：
-      - 松江校区: 以 '松' 开头，例：松1334、松2138
-      - 延安路校区: 多数为数字+'教'，例：1教101、4教310、8教205；
-                    少数历史命名直接以 '延' 开头。
-    其他（'线上教学'、外部场地等）返回 '' 视为未知。
-    """
-    if not classroom:
-        return ""
-    s = classroom.strip()
-    if s.startswith("松"):
+@lru_cache(maxsize=4096)
+def detect_campus(classroom, selection_scope=""):
+    """优先根据教室名判断校区，无法识别时使用选课范围字段兜底。"""
+    location = str(classroom or "").strip()
+    if (location.startswith("松") or
+            any(keyword in location for keyword in (
+                "松江", "大学生体育中心", "刘翔体育场", "学院楼", "图文",
+                "化工楼", "复材大楼", "综合实验楼", "工程训练中心",
+            ))):
         return "松江"
-    if s.startswith("延"):
+    if (location.startswith("延") or "延安路" in location or
+            re.match(r"^[1-4]教", location) or
+            "逸夫楼" in location or re.match(r"^逸\d", location) or
+            "中南楼" in location or location.startswith(("中南", "中北")) or
+            re.match(r"^3[北南主]", location) or
+            any(keyword in location for keyword in ("旭日楼", "管理楼", "IECB"))):
         return "延安路"
-    # <digit>+教 → 延安路（1教/2教/3教/4教/8教 等）
-    if re.match(r"^\d+教", s):
+
+    scope = str(selection_scope or "").strip()
+    if "松江" in scope:
+        return "松江"
+    if "延安路" in scope:
         return "延安路"
     return ""
 
@@ -554,21 +568,49 @@ def detect_campus_from_major(suggested_major):
 
 
 def class_campus(cls):
-    """优先 suggested_major，回退到第一条 schedule 的教室"""
-    by_major = detect_campus_from_major(cls.get("suggested_major", ""))
-    if by_major:
-        return by_major
+    """优先按教室判断，无法识别时使用抓取到的选课范围字段。"""
+    selection_scope = cls.get("selection_scope", "") or cls.get("suggested_major", "")
     for sch in (cls.get("schedule") or []):
-        c = detect_campus(sch.get("classroom", ""))
+        c = detect_campus(sch.get("classroom", ""), selection_scope)
         if c:
             return c
-    return ""
+    return detect_campus("", selection_scope)
 
 
 # ── 查询引擎 ──────────────────────────────────────────────────────
 class CourseQueryEngine:
     def __init__(self, data):
         self.courses = data.get("courses", [])
+        self._selection_scopes_ready = False
+
+    def _ensure_selection_scopes(self):
+        """为旧版数据从 raw_html 恢复抓取时未保存的选课范围字段。"""
+        if self._selection_scopes_ready:
+            return
+        for course in self.courses:
+            timetable = course.get("timetable") or {}
+            classes = timetable.get("classes") or []
+            needs_scope = [
+                cls for cls in classes
+                if "selection_scope" not in cls
+                and not any(
+                    detect_campus(sch.get("classroom", ""))
+                    for sch in (cls.get("schedule") or [])
+                )
+            ]
+            if not needs_scope:
+                continue
+            raw_html = timetable.get("raw_html", "")
+            if "松江" not in raw_html and "延安路" not in raw_html:
+                continue
+            parsed = _parse_timetable_html(raw_html)
+            scopes = {
+                str(cls.get("cttId", "")): cls.get("selection_scope", "")
+                for cls in parsed
+            }
+            for cls in needs_scope:
+                cls["selection_scope"] = scopes.get(str(cls.get("cttId", "")), "")
+        self._selection_scopes_ready = True
 
     def query(self, course_code_prefix="", course_name_keyword="", campus="", only_available=False,
               day_filter=0, period_filter=0, teacher_keyword=""):
@@ -580,6 +622,8 @@ class CourseQueryEngine:
         """
         results = []
         teacher_kw = teacher_keyword.strip().lower()
+        if campus:
+            self._ensure_selection_scopes()
 
         for course in self.courses:
             kcbh = course.get("kcbh", "")
@@ -621,6 +665,7 @@ class CourseQueryEngine:
                 # 解析调度信息
                 schedules = cls.get("schedule", [])
                 schedules = schedules or []
+                selection_scope = cls.get("selection_scope", "") or cls.get("suggested_major", "")
 
                 # 时间筛选：只要该班级任一 schedule 匹配即保留
                 if day_filter > 0 or period_filter > 0:
@@ -632,6 +677,11 @@ class CourseQueryEngine:
                     matched = False
                     for sch in schedules:
                         day, periods = parse_time_slot(sch.get("time_slot", ""))
+                        campus_sch = detect_campus(sch.get("classroom", ""), selection_scope)
+
+                        # 校区筛选（从 schedule 的教室判断）
+                        if campus and campus_sch != campus:
+                            continue
 
                         # 星期匹配
                         if day_filter > 0:
@@ -653,7 +703,7 @@ class CourseQueryEngine:
                     # 校区筛选（无时间筛选时，班级级别优先 suggested_major 字段）
                     if campus:
                         cls_campus = class_campus(cls)
-                        if cls_campus and cls_campus != campus:
+                        if cls_campus != campus:
                             continue
 
                 # 构建显示用时间字符串
@@ -682,41 +732,67 @@ class CourseQueryEngine:
 
 
 # ── UI ─────────────────────────────────────────────────────────────
-class CourseQueryUI(QMainWindow):
-    def __init__(self):
-        super().__init__()
+class CourseQueryUI(QWidget):
+    """Reusable course query workspace, embeddable in the main application."""
+
+    def __init__(self, parent=None, *, embedded=False, cookie_provider=None,
+                 course_add_callback=None):
+        super().__init__(parent)
         self.data = None
         self.engine = None
         self.dark_mode = True
+        self.fetch_thread = None
+        self._closing = False
+        self.embedded = embedded
+        self.cookie_provider = cookie_provider
+        self.course_add_callback = course_add_callback
 
-        self.setObjectName("MainWindow")
+        self.setObjectName("CourseQueryPanel")
         self.setWindowTitle("📖 开课数据查询工具")
-        self.setGeometry(80, 80, 1300, 850)
-        self.setMinimumSize(1000, 700)
+        if not embedded:
+            self.resize(1300, 850)
+            self.setMinimumSize(1000, 700)
 
         self._setup_ui()
-        self._setup_menu()
         self._apply_style()
-
-        self.statusBar().showMessage("就绪 | 文件: 未加载")
+        self._show_status("就绪 · 文件尚未加载")
 
     # ── UI 构建 ────────────────────────────────────────────────
     def _setup_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(25, 20, 25, 20)
-        main_layout.setSpacing(15)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0 if self.embedded else 25, 12 if self.embedded else 20,
+                                       0 if self.embedded else 25, 0 if self.embedded else 20)
+        main_layout.setSpacing(12)
 
         # ── 标题 ──
-        title = QLabel("📖 开课数据查询")
-        title.setFont(QFont("Microsoft YaHei UI", 22, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(title)
+        if not self.embedded:
+            title = QLabel("开课数据查询")
+            title.setObjectName("Title")
+            title.setFont(QFont("Microsoft YaHei UI", 22, QFont.Bold))
+            title.setAlignment(Qt.AlignLeft)
+            main_layout.addWidget(title)
+
+        action_layout = QHBoxLayout()
+        self.load_button = QPushButton("导入数据")
+        self.load_button.clicked.connect(self._do_load)
+        action_layout.addWidget(self.load_button)
+        self.fetch_all_button = QPushButton("重新抓取全部")
+        self.fetch_all_button.clicked.connect(self._do_fetch_all)
+        action_layout.addWidget(self.fetch_all_button)
+        self.fetch_specific_button = QPushButton("抓取指定课程")
+        self.fetch_specific_button.clicked.connect(self._do_fetch_specific)
+        action_layout.addWidget(self.fetch_specific_button)
+        self.fetch_buttons = (self.fetch_all_button, self.fetch_specific_button)
+        action_layout.addStretch()
+        self.status_label = QLabel()
+        self.status_label.setObjectName("Muted")
+        action_layout.addWidget(self.status_label)
+        main_layout.addLayout(action_layout)
 
         # ── 筛选面板 ──
         filter_group = QGroupBox("筛选条件")
         filter_group.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
+        filter_group.setMinimumHeight(120)
         filter_layout = QGridLayout(filter_group)
         filter_layout.setSpacing(12)
         filter_layout.setContentsMargins(15, 20, 15, 15)
@@ -777,22 +853,28 @@ class CourseQueryUI(QMainWindow):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        self.query_btn = QPushButton("🔍 查询")
+        self.query_btn = QPushButton("查询课程")
+        self.query_btn.setObjectName("Primary")
         self.query_btn.setFont(QFont("Microsoft YaHei UI", 13, QFont.Bold))
         self.query_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.query_btn.setMinimumSize(140, 42)
         self.query_btn.clicked.connect(self._do_query)
         btn_layout.addWidget(self.query_btn)
 
-        self.reset_btn = QPushButton("↺ 重置")
+        self.reset_btn = QPushButton("重置条件")
         self.reset_btn.setFont(QFont("Microsoft YaHei UI", 13))
         self.reset_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.reset_btn.setMinimumSize(120, 42)
         self.reset_btn.clicked.connect(self._do_reset)
         btn_layout.addWidget(self.reset_btn)
 
-        filter_layout.addLayout(btn_layout, 2, 0, 1, 6)
+        self.add_course_btn = QPushButton("加入待选")
+        self.add_course_btn.clicked.connect(self._add_selected_course)
+        self.add_course_btn.setVisible(self.course_add_callback is not None)
+        btn_layout.addWidget(self.add_course_btn)
+
         main_layout.addWidget(filter_group)
+        main_layout.addLayout(btn_layout)
 
         # ── 结果统计 ──
         self.count_label = QLabel("共查询到 0 条结果")
@@ -800,13 +882,21 @@ class CourseQueryUI(QMainWindow):
         main_layout.addWidget(self.count_label)
 
         # ── 结果表格 ──
-        self.table = QTableWidget()
+        self.table = QTableView()
+        self.table_model = CourseTableModel(self)
+        self.table.setModel(self.table_model)
+        self.table.setWordWrap(False)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.setFont(QFont("Microsoft YaHei UI", 10))
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSortingEnabled(True)
+        self.table.doubleClicked.connect(lambda _index: self._add_selected_course())
 
         headers = [
             ("课程代码", 100), ("课程编号", 70), ("课程名称", 200), ("学分", 50),
@@ -814,8 +904,6 @@ class CourseQueryUI(QMainWindow):
             ("已申请", 55), ("已录取", 55), ("余量", 55),
             ("教师", 100), ("校区", 60), ("上课时间", 350),
         ]
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels([h[0] for h in headers])
         self.header = self.table.horizontalHeader()
         for i, (_, w) in enumerate(headers):
             self.header.setSectionResizeMode(i, QHeaderView.Interactive)
@@ -823,207 +911,30 @@ class CourseQueryUI(QMainWindow):
         # 上课时间列可伸缩
         self.header.setSectionResizeMode(11, QHeaderView.Stretch)
 
+        self.table.sortByColumn(0, Qt.AscendingOrder)
         self.table.setMinimumHeight(300)
         main_layout.addWidget(self.table, 1)
 
     # ── 样式 ────────────────────────────────────────────────────
     def _apply_style(self):
-        if self.dark_mode:
-            colors = {
-                "bg_start": "#202040", "bg_mid": "#1a1a2e", "bg_end": "#202060",
-                "text": "#FFFFFF", "card": "rgba(255,255,255,0.08)",
-                "card_border": "rgba(255,255,255,0.15)",
-                "input": "rgba(0,0,0,0.2)", "btn1": "#4B0082", "btn2": "#483D8B",
-                "btn_hover": "#6A5ACD", "table_bg": "rgba(0,0,0,0.15)",
-                "table_alt": "rgba(255,255,255,0.04)",
-                "table_sel": "rgba(0,198,255,0.25)",
-                "group_bg": "rgba(255,255,255,0.06)",
-                "available_fg": "#00FF7F",
-                "full_fg": "#FF6B6B",
-                "scroll_bg": "rgba(255,255,255,0.05)",
-                "scroll_handle": "rgba(255,255,255,0.2)",
-                "header_bg": "#2D2D5E",
-                "header_text": "#FFFFFF",
-            }
-        else:
-            colors = {
-                "bg_start": "#F0F3F9", "bg_mid": "#E6EAF0", "bg_end": "#DCE4F0",
-                "text": "#202020", "card": "rgba(255,255,255,0.75)",
-                "card_border": "rgba(0,0,0,0.08)",
-                "input": "#FFFFFF", "btn1": "#3B82F6", "btn2": "#2563EB",
-                "btn_hover": "#2563EB", "table_bg": "#FFFFFF",
-                "table_alt": "rgba(0,0,0,0.02)",
-                "table_sel": "rgba(59,130,246,0.15)",
-                "group_bg": "rgba(255,255,255,0.6)",
-                "available_fg": "#16A34A",
-                "full_fg": "#DC2626",
-                "scroll_bg": "#F0F0F0",
-                "scroll_handle": "#C0C0C0",
-                "header_bg": "#D6DAE2",
-                "header_text": "#202020",
-            }
+        self.setStyleSheet(workspace_style(self.dark_mode))
+        self.table_model.set_dark_mode(self.dark_mode)
 
-        self.avail_colors = (colors["available_fg"], colors["full_fg"])
-        qss = f"""
-        QMainWindow#MainWindow {{
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                stop:0 {colors['bg_start']}, stop:0.5 {colors['bg_mid']}, stop:1 {colors['bg_end']});
-        }}
-        QLabel {{ color: {colors['text']}; background: transparent; }}
-        QGroupBox {{
-            background-color: {colors['group_bg']};
-            border: 1px solid {colors['card_border']};
-            border-radius: 10px; margin-top: 12px;
-            font-weight: bold; color: {colors['text']};
-        }}
-        QGroupBox::title {{
-            subcontrol-origin: margin; subcontrol-position: top left;
-            padding: 2px 10px;
-        }}
-        QLineEdit, QComboBox {{
-            background-color: {colors['input']};
-            border: 1px solid {colors['card_border']};
-            border-radius: 6px; padding: 4px 8px;
-            color: {colors['text']};
-            selection-background-color: {colors['btn1']};
-        }}
-        QComboBox::drop-down {{ border: none; width: 24px; }}
-        QComboBox QAbstractItemView {{
-            background-color: {colors['input']};
-            color: {colors['text']};
-            selection-background-color: {colors['btn1']};
-        }}
-        QCheckBox {{
-            color: {colors['text']}; spacing: 8px;
-        }}
-        QCheckBox::indicator {{
-            width: 18px; height: 18px;
-            border: 1px solid {colors['card_border']};
-            border-radius: 4px; background-color: {colors['input']};
-        }}
-        QCheckBox::indicator:checked {{
-            background-color: {colors['btn1']};
-            border-color: {colors['btn1']};
-        }}
-        QPushButton {{
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                stop:0 {colors['btn1']}, stop:1 {colors['btn2']});
-            color: #FFFFFF; border: none; border-radius: 8px; padding: 6px 18px;
-        }}
-        QPushButton:hover {{ background-color: {colors['btn_hover']}; }}
-        QMenuBar {{
-            background-color: {colors['header_bg']};
-            color: {colors['header_text']};
-            border: none;
-            padding: 2px;
-        }}
-        QMenuBar::item {{
-            color: {colors['header_text']};
-            padding: 4px 12px;
-            border-radius: 4px;
-        }}
-        QMenuBar::item:selected {{
-            background-color: {colors['btn1']};
-        }}
-        QMenu {{
-            background-color: {colors['input']};
-            color: {colors['text']};
-            border: 1px solid {colors['card_border']};
-            border-radius: 6px;
-            padding: 4px;
-        }}
-        QMenu::item {{
-            padding: 6px 24px 6px 12px;
-            border-radius: 4px;
-        }}
-        QMenu::item:selected {{
-            background-color: {colors['btn1']};
-            color: #FFFFFF;
-        }}
-        QMenu::separator {{
-            height: 1px;
-            background: {colors['card_border']};
-            margin: 4px 8px;
-        }}
-        QTableWidget {{
-            background-color: {colors['table_bg']};
-            alternate-background-color: {colors['table_alt']};
-            border: 1px solid {colors['card_border']};
-            border-radius: 8px; gridline-color: {colors['card_border']};
-            color: {colors['text']};
-        }}
-        QTableWidget::item:selected {{
-            background-color: {colors['table_sel']};
-        }}
-        QHeaderView::section {{
-            background-color: {colors['header_bg']};
-            color: {colors['header_text']};
-            padding: 6px; border: none;
-            border-bottom: 1px solid {colors['card_border']};
-            border-right: 1px solid {colors['card_border']};
-            font-weight: bold;
-        }}
-        QHeaderView::section:vertical {{
-            background-color: {colors['header_bg']};
-            color: {colors['header_text']};
-            padding: 2px 6px; border: none;
-            border-bottom: 1px solid {colors['card_border']};
-            border-right: 1px solid {colors['card_border']};
-        }}
-        QTableCornerButton::section {{
-            background-color: {colors['header_bg']};
-            border: none;
-            border-bottom: 1px solid {colors['card_border']};
-            border-right: 1px solid {colors['card_border']};
-        }}
-        QStatusBar {{ color: {colors['text']}; background: transparent; }}
-        QScrollBar:vertical {{
-            background: {colors['scroll_bg']}; width: 10px; border-radius: 5px;
-        }}
-        QScrollBar::handle:vertical {{
-            background: {colors['scroll_handle']}; border-radius: 5px; min-height: 30px;
-        }}
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-        QMessageBox {{
-            background-color: {colors['bg_mid']};
-            color: {colors['text']};
-        }}
-        QMessageBox QLabel {{
-            color: {colors['text']};
-            font-size: 13px;
-        }}
-        QMessageBox QPushButton {{
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                stop:0 {colors['btn1']}, stop:1 {colors['btn2']});
-            color: #FFFFFF;
-            border: none;
-            border-radius: 6px;
-            padding: 8px 24px;
-            font-weight: bold;
-            min-width: 80px;
-            min-height: 30px;
-        }}
-        QMessageBox QPushButton:hover {{
-            background-color: {colors['btn_hover']};
-        }}
-        """
-        self.setStyleSheet(qss)
+    def set_dark_mode(self, dark_mode):
+        self.dark_mode = dark_mode
+        self._apply_style()
 
-    # ── 菜单栏 ───────────────────────────────────────────────────
-    def _setup_menu(self):
-        menubar = self.menuBar()
+    def _show_status(self, message, timeout=0):
+        self.status_label.setText(message)
 
-        # 文件菜单
-        file_menu = menubar.addMenu("📂 文件")
-        file_menu.addAction("📂 导入文件...", self._do_load)
-
-        file_menu.addSeparator()
-        file_menu.addAction("❌ 退出", self.close)
-
-        # 数据菜单
-        data_menu = menubar.addMenu("🌐 数据")
-        data_menu.addAction("🌐 重新抓取全部课程", self._do_fetch_all)
-        data_menu.addAction("🎯 抓取指定课程...", self._do_fetch_specific)
+    def _fetch_identity(self):
+        if self.cookie_provider is not None:
+            return self.cookie_provider()
+        cookies_dict = load_cookies_dict()
+        if not cookies_dict:
+            return "", ""
+        user = next(iter(cookies_dict))
+        return user, cookies_dict[user]
 
     # ── 抓取操作 ─────────────────────────────────────────────────
     def _do_fetch_all(self):
@@ -1065,15 +976,13 @@ class CourseQueryUI(QMainWindow):
 
     def _start_fetch(self, course_codes=None):
         """启动抓取线程"""
-        # 获取 cookie
-        cookies_dict = load_cookies_dict()
-        if not cookies_dict:
-            QMessageBox.warning(self, "无 Cookie",
-                "cookies.json 为空或不存在。\n请先运行主抢课程序获取有效的 Cookie。")
+        if self.fetch_thread is not None:
             return
-
-        user = list(cookies_dict.keys())[0]
-        cookie_str = cookies_dict[user]
+        user, cookie_str = self._fetch_identity()
+        if not cookie_str:
+            QMessageBox.warning(self, "无 Cookie",
+                "请先在工作台选择账号并更新 Cookie。")
+            return
 
         # 禁用菜单防止重复点击
         self._set_fetch_menu_enabled(False)
@@ -1094,36 +1003,49 @@ class CourseQueryUI(QMainWindow):
         self.fetch_thread.error_signal.connect(self.fetch_dialog.on_error)
         self.fetch_thread.finished_signal.connect(self._on_fetch_finished)
         self.fetch_thread.error_signal.connect(self._on_fetch_error)
-
+        self.fetch_thread.finished.connect(self._fetch_stopped)
         self.fetch_thread.start()
-        self.fetch_dialog.show()  # 非阻塞；ApplicationModal 阻断主窗交互
-        self.statusBar().showMessage(f"🔄 正在抓取课程数据（用户: {user}）...")
+        self.fetch_dialog.show()
+        self._show_status(f"正在抓取课程数据 · 账号：{user}")
+
+    def _fetch_stopped(self):
+        self.fetch_thread.deleteLater()
+        self.fetch_thread = None
+        self._set_fetch_menu_enabled(True)
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event):
+        if self.fetch_thread is not None and self.fetch_thread.isRunning():
+            self._closing = True
+            self.fetch_thread.stop()
+            self._show_status("正在停止抓取，等待当前请求结束…")
+            event.ignore()
+            return
+        self._closing = False
+        event.accept()
 
     def _on_fetch_progress(self, msg):
         """抓取进度更新"""
-        self.statusBar().showMessage(msg)
+        self._show_status(msg)
         # 也输出到 count_label 方便查看
         self.count_label.setText(msg)
 
     def _on_fetch_finished(self, data):
         """抓取完成"""
-        self._set_fetch_menu_enabled(True)
-        self.statusBar().showMessage(f"✅ 抓取完成，共 {len(data.get('courses', []))} 门课程", 5000)
+        self._show_status(f"抓取完成 · 共 {len(data.get('courses', []))} 门课程")
         # 自动加载抓取结果
         self._load_file("courses_full.json")
 
     def _on_fetch_error(self, msg):
         """抓取出错"""
-        self._set_fetch_menu_enabled(True)
-        self.statusBar().showMessage("❌ 抓取出错", 5000)
+        self._show_status("抓取出错")
         QMessageBox.critical(self, "抓取出错", msg)
 
     def _set_fetch_menu_enabled(self, enabled):
         """切换抓取菜单的启用状态"""
-        for action in self.menuBar().actions():
-            if action.text() == "🌐 数据":
-                action.setEnabled(enabled)
-                break
+        for button in self.fetch_buttons:
+            button.setEnabled(enabled)
 
     # ── 操作 ────────────────────────────────────────────────────
     def _do_load(self):
@@ -1138,11 +1060,8 @@ class CourseQueryUI(QMainWindow):
         try:
             self.data = load_courses(path)
             self.engine = CourseQueryEngine(self.data)
-            self.statusBar().showMessage(
-                f"已加载: {path} | "
-                f"共 {len(self.data.get('courses', []))} 门课程",
-                5000
-            )
+            self._show_status(
+                f"已加载：{os.path.basename(path)} · {len(self.data.get('courses', []))} 门课程")
             self._do_query()
         except Exception as e:
             QMessageBox.critical(self, "加载错误", f"无法加载文件:\n{e}")
@@ -1192,36 +1111,26 @@ class CourseQueryUI(QMainWindow):
         self.period_combo.setCurrentIndex(0)
         self._do_query()
 
+    def _add_selected_course(self):
+        if self.course_add_callback is None:
+            return
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        if not rows and self.table.currentIndex().isValid():
+            rows = [self.table.currentIndex().row()]
+        if not rows:
+            QMessageBox.information(self, "请选择课程", "请先在结果表格中选择一门课程。")
+            return
+        added = 0
+        for row in rows:
+            course = self.table_model.rows[row]
+            course_id = str(course.get("cttId", "")).strip()
+            if course_id and self.course_add_callback(course_id):
+                added += 1
+        if added:
+            self._show_status(f"已将 {added} 门课程加入待选计划")
+
     def _populate_table(self, results):
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(results))
-        self.table.setAlternatingRowColors(True)
-
-        for row, r in enumerate(results):
-            remaining = r["maxCnt"] - r["enrollCnt"]
-            is_full = remaining <= 0
-
-            items = [
-                r["kcbh"], r["cttId"], r["kcmc"], str(r["xf"]),
-                r["classNo"], str(r["maxCnt"]),
-                str(r["enrollCnt"]), str(r["applyCnt"]),
-                str(remaining) if remaining >= 0 else "0",
-                r["teacher"], r["campus"], r["schedule"],
-            ]
-
-            for col, text in enumerate(items):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignCenter if col not in (2, 9, 11) else Qt.AlignLeft | Qt.AlignVCenter)
-                if col == 8:  # 余量列
-                    fg = self.avail_colors[0] if remaining > 0 else self.avail_colors[1]
-                    item.setForeground(QBrush(QColor(fg)))
-                    if remaining > 0:
-                        font = item.font()
-                        font.setBold(True)
-                        item.setFont(font)
-                self.table.setItem(row, col, item)
-
-        self.table.setSortingEnabled(True)
+        self.table_model.set_rows(results)
 
         # 统计
         total = len(results)
@@ -1239,9 +1148,7 @@ class CourseQueryUI(QMainWindow):
             f"| 已申请: {total_applied}  |  已录取: {total_enrolled}  {rate_str}"
         )
 
-        self.statusBar().showMessage(
-            f"查询完成: {total} 条结果 | {avail} 门可选", 3000
-        )
+        self._show_status(f"查询完成 · {total} 条结果 · {avail} 门可选")
 
 
 def main():

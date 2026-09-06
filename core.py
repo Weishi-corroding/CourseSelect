@@ -17,10 +17,6 @@ import requests
 import threading
 from requests.adapters import HTTPAdapter
 
-# RSA 加密 (替代 Selenium 浏览器登录)
-from cryptography.hazmat.primitives.asymmetric import padding as _rsa_padding
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
-
 if sys.stdin is None:
     try:
         sys.stdin = open(os.devnull, 'r')
@@ -188,6 +184,9 @@ def _build_pem(pub_key_b64):
 
 def _rsa_encrypt_password(pub_key_b64, password):
     """对齐 DLSF: node-forge 的 RSAES-PKCS1-V1_5 == cryptography 的 PKCS1v15。"""
+    # Only login needs RSA; opening the workspace should not initialize it.
+    from cryptography.hazmat.primitives.asymmetric import padding as _rsa_padding
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
     pub = load_pem_public_key(_build_pem(pub_key_b64).encode("utf-8"))
     encrypted = pub.encrypt(password.encode("utf-8"), _rsa_padding.PKCS1v15())
     return base64.b64encode(encrypted).decode("ascii")
