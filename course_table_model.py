@@ -26,7 +26,7 @@ class CourseTableModel(QAbstractTableModel):
         self.endResetModel()
 
     def _sort_value(self, row, column):
-        value = max(0, row['maxCnt'] - row['enrollCnt']) if column == 8 else row.get(self.KEYS[column], '')
+        value = max(0, row.get('maxCnt', 0) - row.get('applyCnt', 0)) if column == 8 else row.get(self.KEYS[column], '')
         if column in self.NUMERIC_COLUMNS:
             try:
                 return float(value)
@@ -76,7 +76,7 @@ class CourseTableModel(QAbstractTableModel):
             return None
         row, column = self.rows[index.row()], index.column()
         if role in (Qt.DisplayRole, Qt.ToolTipRole, Qt.UserRole):
-            value = max(0, row['maxCnt'] - row['enrollCnt']) if column == 8 else row.get(self.KEYS[column], '')
+            value = max(0, row.get('maxCnt', 0) - row.get('applyCnt', 0)) if column == 8 else row.get(self.KEYS[column], '')
             if role == Qt.UserRole and column in self.NUMERIC_COLUMNS:
                 try:
                     return float(value)
@@ -86,7 +86,7 @@ class CourseTableModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole:
             return int((Qt.AlignLeft if column in (2, 9, 11) else Qt.AlignHCenter) | Qt.AlignVCenter)
         if column == 8:
-            available = row['maxCnt'] > row['enrollCnt']
+            available = row.get('maxCnt', 0) > row.get('applyCnt', 0)
             if role == Qt.ForegroundRole:
                 return self.available_color if available else self.full_color
             if role == Qt.FontRole and available:

@@ -652,7 +652,7 @@ class CourseQueryEngine:
                 continue
 
             for cls in classes:
-                enroll_cnt = cls.get("enrollCnt", 0)
+                apply_cnt = cls.get("applyCnt", 0)
                 max_cnt = cls.get("maxCnt", 0)
 
                 # 教师姓名部分匹配（班级粒度，不区分大小写）
@@ -662,7 +662,7 @@ class CourseQueryEngine:
                         continue
 
                 # 未录满筛选
-                if only_available and enroll_cnt >= max_cnt:
+                if only_available and apply_cnt >= max_cnt:
                     continue
 
                 # 解析调度信息
@@ -724,8 +724,8 @@ class CourseQueryEngine:
                     "classNo": cls.get("classNo", ""),
                     "cttId": cls.get("cttId", ""),
                     "maxCnt": max_cnt,
-                    "enrollCnt": enroll_cnt,
-                    "applyCnt": cls.get("applyCnt", 0),
+                    "enrollCnt": cls.get("enrollCnt", 0),
+                    "applyCnt": apply_cnt,
                     "teacher": cls.get("teacher_name", ""),
                     "schedule": time_str,
                     "campus": class_campus(cls),
@@ -1152,7 +1152,7 @@ class CourseQueryUI(QWidget):
         total_cap = sum(r["maxCnt"] for r in results)
         total_applied = sum(r["enrollCnt"] for r in results)  # 已申请
         total_enrolled = sum(r["applyCnt"] for r in results)  # 已录取
-        avail = sum(1 for r in results if r["maxCnt"] - r["enrollCnt"] > 0)
+        avail = sum(1 for r in results if r["maxCnt"] - r["applyCnt"] > 0)
 
         prefix = self.code_input.text().strip()
         prefix_info = f" | 前缀: {prefix}" if prefix else ""
