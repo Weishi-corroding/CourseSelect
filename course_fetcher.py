@@ -8,11 +8,11 @@ API:
   GET COURSE TIME TABLE INFO   →  获取某门课的具体开课信息 (班级、容量、教师、时间地点)
 
 用法:
-  python fetch_courses.py                         # 使用 cookies.json 中第一个有效用户的 cookie
-  python fetch_courses.py --user "张三"            # 指定用户
-  python fetch_courses.py --term 88               # 指定学期 ID (默认 88)
-  python fetch_courses.py --limit 10              # 仅抓取前 N 门课 (测试用)
-  python fetch_courses.py --output courses_full.json
+  python course_fetcher.py                         # 使用 cookies.json 中第一个有效用户的 cookie
+  python course_fetcher.py --user "张三"            # 指定用户
+  python course_fetcher.py --term 88               # 指定学期 ID (默认 88)
+  python course_fetcher.py --limit 10              # 仅抓取前 N 门课 (测试用)
+  python course_fetcher.py --output courses_full.json
 """
 
 import sys

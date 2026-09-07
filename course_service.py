@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""核心功能模块 - 登录、选课逻辑 - 纯 HTTP + RSA 版"""
+"""课程服务：登录、选课和本地数据读写。"""
 
 import sys
 import os

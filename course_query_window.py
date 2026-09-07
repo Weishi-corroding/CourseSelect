@@ -25,16 +25,16 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont, QColor, QBrush, QCursor
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer
 from course_table_model import CourseTableModel
-from ui_support import workspace_style, InterruptibleThread
+from ui_components import workspace_style, InterruptibleThread
 from functools import lru_cache
 
 # ── 抓取课程线程 ─────────────────────────────────────────────────────
-from fetch_courses import (
+from course_fetcher import (
     fetch_course_list, fetch_course_timetable, load_cookies_dict,
     cleanup_fetch_session, _parse_timetable_html, SessionExpired,
 )
 # 自动重新登录依赖
-from core import get_cookies, load_accounts, save_cookies_dict
+from course_service import get_cookies, load_accounts, save_cookies_dict
 
 # 自动重新登录用的默认账号（匹配 accounts.json 中的 name 字段）
 AUTO_RELOGIN_ACCOUNT_NAME = "卫宁远"
@@ -256,7 +256,7 @@ DATA_FILE = "courses_full.json"
 class FetchProgressDialog(QDialog):
     """全量/指定课程抓取的实时进度弹窗。
 
-    镜像 modern_ui_production.py 中 CaptchaDialog / StyledInputDialog 的样式约定：
+    镜像 main_window.py 中 CaptchaDialog / StyledInputDialog 的样式约定：
     从 parent 读取 dark_mode，使用相同的紫色/蓝色渐变和按钮主题色。
     """
     def __init__(self, parent, thread):

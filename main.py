@@ -9,7 +9,7 @@ from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt
 
 # 导入生产版本的 Glassmorphism UI
-from modern_ui_production import ProductionGlassmorphismUI
+from main_window import ProductionGlassmorphismUI
 
 LOG_FILE = "CoureseSelectDebug.log"
 

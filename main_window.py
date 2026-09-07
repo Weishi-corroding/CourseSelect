@@ -22,8 +22,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont, QColor, QCursor, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer, QTime
 
-# 导入 core
-from core import (
+# 导入课程服务
+from course_service import (
     load_accounts, save_accounts, load_courses, save_courses,
     load_cookies_dict, save_cookies_dict, load_delete_courses, save_delete_courses,
     get_cookies, sccourse, cancelSC, send_push_notification,
@@ -31,7 +31,7 @@ from core import (
 )
 
 file_lock = QMutex()
-from ui_support import BufferedLogView, InterruptibleThread, workspace_style
+from ui_components import BufferedLogView, InterruptibleThread, workspace_style
 
 
 class DeletableListWidget(QListWidget):
@@ -167,7 +167,7 @@ class SingleCourseWorker(InterruptibleThread):
         self.log_signal.emit(msg)
         self.success_signal.emit(self.course_id)
         if self.push_token:
-            from core import send_push_notification
+            from course_service import send_push_notification
             send_push_notification(self.push_token, "🎉 抢课成功通知", f"恭喜！{self.user_display_name} 抢到：{self.course_id}")
         self.remove_course_from_json()
 
@@ -335,7 +335,7 @@ class PickUpWorker(InterruptibleThread):
         self.success_signal.emit(ctt_id)
         
         if self.push_token:
-            from core import send_push_notification
+            from course_service import send_push_notification
             send_push_notification(self.push_token, "捡漏成功通知", msg)
             
         if ctt_id in self.target_ctt_ids:
@@ -1383,7 +1383,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_courses_tab(), "课程计划")
         self.tabs.addTab(self._create_logs_tab(), "运行日志")
-        from course_query_ui import CourseQueryUI
+        from course_query_window import CourseQueryUI
         self.query_panel = CourseQueryUI(
             self,
             embedded=True,
@@ -1758,7 +1758,7 @@ class ProductionGlassmorphismUI(QMainWindow):
             self.save_settings()
             if self.push_token:
                 self.log_display.append(f"📲 推送 Token 已保存: {self.push_token[:4]}****")
-                from core import send_push_notification
+                from course_service import send_push_notification
                 send_push_notification(self.push_token, "抢课系统测试", "您的 Token 配置成功！")
             else:
                 self.log_display.append("📲 推送功能已关闭")
@@ -2026,7 +2026,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         if not ctt_map:
             QMessageBox.warning(self, "提示",
                 f"未找到 {self.PICKUP_DATA_FILE} 或文件为空。\n"
-                "请先运行 fetch_courses.py 生成开课数据文件。")
+                "请先运行 course_fetcher.py 生成开课数据文件。")
             return
 
         # 按课程编号 (kcbh) 分组
@@ -2045,7 +2045,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         if not kcbh_groups and not unknown_ctt:
             QMessageBox.warning(self, "提示",
                 f"在 {self.PICKUP_DATA_FILE} 中未找到任何待抢课程对应的开课数据。\n"
-                "请确认课程ID (cttId) 正确，或重新运行 fetch_courses.py。")
+                "请确认课程ID (cttId) 正确，或重新运行 course_fetcher.py。")
             return
 
         # 弹出课程多选窗口（默认全选）
@@ -2097,7 +2097,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         # ── 检查数据文件 ──
         if not os.path.exists(self.PICKUP_DATA_FILE):
             QMessageBox.warning(self, "提示",
-                f"未找到 {self.PICKUP_DATA_FILE}，请先运行 fetch_courses.py。")
+                f"未找到 {self.PICKUP_DATA_FILE}，请先运行 course_fetcher.py。")
             return
 
         cookies = load_cookies_dict().get(u, "")
