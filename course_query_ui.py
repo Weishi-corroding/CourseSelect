@@ -47,11 +47,12 @@ class FetchCoursesThread(InterruptibleThread):
     finished_signal = pyqtSignal(object)  # dict: 完整数据
     error_signal = pyqtSignal(str)
 
-    def __init__(self, cookie_str, course_codes=None, term_id=88):
+    def __init__(self, cookie_str, course_codes=None, term_id=88, *, skip_polite_wait=False):
         super().__init__()
         self.cookie_str = cookie_str
         self.course_codes = course_codes   # None=全部, [list]=指定课程代码
         self.term_id = term_id
+        self.skip_polite_wait = skip_polite_wait
         self._stop_requested = False
         self._relogin_attempts = 0   # 一次会话内只允许重登一次，防死循环
 
@@ -173,6 +174,8 @@ class FetchCoursesThread(InterruptibleThread):
             # 逐门获取详细开课信息
             total = len(normalized)
             self.progress.emit(f"🚀 开始获取 {total} 门课程的详细信息...")
+            if self.skip_polite_wait:
+                self.progress.emit("⚡ 极速模式已启用：跳过课程之间的礼貌等待")
 
             results = []
             cancelled = False
@@ -192,8 +195,8 @@ class FetchCoursesThread(InterruptibleThread):
                 )
                 results.append({**course, "timetable": timetable})
 
-                # 礼貌性延迟
-                if i < total - 1:
+                # 正常模式下礼貌等待，极速模式连续请求。
+                if not self.skip_polite_wait and i < total - 1:
                     self.msleep(300)
 
             if cancelled or not self.is_running:
@@ -937,18 +940,31 @@ class CourseQueryUI(QWidget):
         return user, cookies_dict[user]
 
     # ── 抓取操作 ─────────────────────────────────────────────────
+    def _confirm_fetch_options(self, summary):
+        """显示抓取确认框，并返回是否跳过课程间的礼貌等待。"""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setWindowTitle("确认抓取")
+        dialog.setText(summary)
+        dialog.setInformativeText("常规模式会在每门课程详情之间等待 0.3 秒。")
+        fast_mode = QCheckBox("跳过礼貌等待，连续拉取课程列表和课表信息")
+        fast_mode.setToolTip("启用后将不再等待，直到抓取完成或手动取消。")
+        dialog.setCheckBox(fast_mode)
+        dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        dialog.setDefaultButton(QMessageBox.No)
+        if dialog.exec_() != QMessageBox.Yes:
+            return None
+        return fast_mode.isChecked()
+
     def _do_fetch_all(self):
         """抓取全部课程"""
-        reply = QMessageBox.question(
-            self, "确认抓取",
+        skip_polite_wait = self._confirm_fetch_options(
             "即将从教务系统重新抓取全部课程的详细开课信息。\n"
-            "此过程需要较长时间，请确保网络连接正常。\n\n"
-            "继续吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            "此过程需要较长时间，请确保网络连接正常。"
         )
-        if reply != QMessageBox.Yes:
+        if skip_polite_wait is None:
             return
-        self._start_fetch()
+        self._start_fetch(skip_polite_wait=skip_polite_wait)
 
     def _do_fetch_specific(self):
         """弹出对话框让用户输入课程代码或编号，只抓取这几门"""
@@ -963,18 +979,15 @@ class CourseQueryUI(QWidget):
         codes = [c.strip() for c in code_text.replace(",", " ").split() if c.strip()]
         if not codes:
             return
-        reply = QMessageBox.question(
-            self, "确认抓取",
+        skip_polite_wait = self._confirm_fetch_options(
             f"即将抓取 {len(codes)} 门指定课程的详细信息：\n"
-            f"{'、'.join(codes[:10])}{'...' if len(codes) > 10 else ''}\n\n"
-            "继续吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            f"{'、'.join(codes[:10])}{'...' if len(codes) > 10 else ''}"
         )
-        if reply != QMessageBox.Yes:
+        if skip_polite_wait is None:
             return
-        self._start_fetch(course_codes=codes)
+        self._start_fetch(course_codes=codes, skip_polite_wait=skip_polite_wait)
 
-    def _start_fetch(self, course_codes=None):
+    def _start_fetch(self, course_codes=None, *, skip_polite_wait=False):
         """启动抓取线程"""
         if self.fetch_thread is not None:
             return
@@ -988,7 +1001,9 @@ class CourseQueryUI(QWidget):
         self._set_fetch_menu_enabled(False)
 
         # 创建并启动线程
-        self.fetch_thread = FetchCoursesThread(cookie_str, course_codes=course_codes)
+        self.fetch_thread = FetchCoursesThread(
+            cookie_str, course_codes=course_codes, skip_polite_wait=skip_polite_wait
+        )
 
         # 进度弹窗
         self.fetch_dialog = FetchProgressDialog(self, self.fetch_thread)

@@ -9,6 +9,7 @@ import random
 import threading
 import time
 import math
+import re
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox,
@@ -373,12 +374,16 @@ class UpgradeWorker(InterruptibleThread):
     finished_signal = pyqtSignal()
     captcha_signal = pyqtSignal()
 
-    def __init__(self, cookies, user_name, current_ctt_id, target_ctt_id, interval=1.0, push_token=""):
+    def __init__(self, cookies, user_name, current_ctt_id, target_ctt_ids, interval=1.0, push_token=""):
         super().__init__()
         self.cookies = cookies
         self.user_name = user_name
         self.current_ctt_id = str(current_ctt_id)
-        self.target_ctt_id = str(target_ctt_id)
+        if isinstance(target_ctt_ids, str):
+            target_ctt_ids = [target_ctt_ids]
+        self.target_ctt_ids = tuple(dict.fromkeys(
+            str(ctt_id).strip() for ctt_id in target_ctt_ids if str(ctt_id).strip()
+        ))
         self.interval = interval
         self.push_token = push_token
         self.is_running = True
@@ -432,129 +437,134 @@ class UpgradeWorker(InterruptibleThread):
 
     def run(self):
         try:
-            # ── 1. 查找信息 ──
             current_info = self._lookup_kcbh(self.current_ctt_id)
-            target_info = self._lookup_kcbh(self.target_ctt_id)
+            target_infos = {}
+            missing_targets = []
+            for target_ctt_id in self.target_ctt_ids:
+                target_info = self._lookup_kcbh(target_ctt_id)
+                if target_info:
+                    target_infos[target_ctt_id] = target_info
+                else:
+                    missing_targets.append(target_ctt_id)
 
-            if not target_info:
-                self.log_signal.emit(f"❌ 未在 courses_full.json 中找到目标课程 (cttId={self.target_ctt_id})")
+            if missing_targets:
+                self.log_signal.emit(
+                    "⚠️ 未在 courses_full.json 中找到备选升级课程："
+                    + "、".join(missing_targets)
+                )
+            if not target_infos:
+                self.log_signal.emit("❌ 没有可监控的备选升级课程")
                 self.finished_signal.emit()
                 return
 
             current_name = current_info["kcmc"] if current_info else self.current_ctt_id
-            target_name = target_info["kcmc"]
-            target_kcbh = target_info["kcbh"]
+            targets_by_course = {}
+            for target_ctt_id, target_info in target_infos.items():
+                targets_by_course.setdefault(target_info["kcbh"], []).append(target_ctt_id)
+            target_labels = [
+                f"{target_infos[target_ctt_id]['kcmc']} ({target_ctt_id})"
+                for target_ctt_id in target_infos
+            ]
 
-            self.log_signal.emit(f"🆙 升级线程启动: [{current_name}] → [{target_name}]")
+            self.log_signal.emit(f"🆙 升级线程启动: [{current_name}] → {len(target_infos)} 个备选课程")
             if current_info:
                 self.log_signal.emit(f"  当前: {current_info['kcbh']} 班序{current_info['classNo']} "
                                      f"({current_info['enrollCnt']}/{current_info['maxCnt']})")
-            self.log_signal.emit(f"  目标: {target_kcbh} ({target_info['enrollCnt']}/{target_info['maxCnt']})")
-            self.log_signal.emit("⏳ 等待目标课程出现空位...")
+            for target_label in target_labels:
+                self.log_signal.emit(f"  备选: {target_label}")
+            self.log_signal.emit("⏳ 等待任一备选课程出现空位...")
+            current_course_dropped = False
 
             while self.is_running:
-                try:
-                    # ── 直接查询班级列表（不用 accessJudge，已选课程会使它失败）──
-                    self.msleep(random.randint(200, 500))
-                    res_str = query_course_info(self.cookies, target_kcbh)
-                    self.check_count += 1
-
+                found_vacancy = False
+                for target_kcbh, target_ctt_ids in targets_by_course.items():
+                    if not self.is_running:
+                        break
                     try:
+                        self.msleep(random.randint(200, 500))
+                        res_str = query_course_info(self.cookies, target_kcbh)
+                        self.check_count += 1
                         data = json.loads(res_str)
                     except json.JSONDecodeError:
-                        if not res_str and self.check_count % 5 == 0:
-                            self.log_signal.emit("⚠️ 查询返回为空，可能被限流")
-                        self.msleep(5000)
+                        if self.check_count % 5 == 0:
+                            self.log_signal.emit("⚠️ 查询返回异常，可能被限流")
+                        continue
+                    except Exception as e:
+                        self.log_signal.emit(f"⚠️ 查询备选课程异常: {e}")
                         continue
 
                     if not data.get("success"):
                         if self.check_count % 5 == 0:
                             self.log_signal.emit(f"⚠️ 查询失败: {data.get('msg', '未知')}")
-                        self.msleep(3000)
                         continue
 
-                    # ── 查找目标班级 ──
-                    found_vacancy = False
                     for cls in data.get("aaData", []):
-                        if str(cls.get("cttId")) == self.target_ctt_id:
-                            enroll = int(cls.get("enrollCnt", 0))
-                            max_cnt = int(cls.get("maxCnt", 0))
-                            remaining = max_cnt - enroll
+                        target_ctt_id = str(cls.get("cttId", ""))
+                        if target_ctt_id not in target_ctt_ids:
+                            continue
+                        enroll = int(cls.get("enrollCnt", 0))
+                        max_cnt = int(cls.get("maxCnt", 0))
+                        remaining = max_cnt - enroll
+                        if remaining <= 0:
+                            continue
 
-                            if remaining > 0:
-                                found_vacancy = True
-                                class_no = cls.get("classNo", "?")
-                                self.log_signal.emit(f"⚡ 发现空位！[{target_name}] 班级[{class_no}] "
-                                                     f"余量: {remaining}/{max_cnt}")
+                        found_vacancy = True
+                        target_info = target_infos[target_ctt_id]
+                        target_name = target_info["kcmc"]
+                        class_no = cls.get("classNo", "?")
+                        self.log_signal.emit(f"⚡ 发现空位！[{target_name}] 班级[{class_no}] "
+                                             f"余量: {remaining}/{max_cnt}")
 
-                                # ── 步骤 A: 退掉当前课程 ──
-                                if current_info:
-                                    cancel_res = cancelSC(self.cookies,
-                                                          current_info["kcbh"],
-                                                          current_info["classNo"])
-                                    self.log_signal.emit(f"📝 退课结果: {cancel_res}")
-                                    # 简单判断退课是否成功
-                                    if '"success":true' not in str(cancel_res) and "成功" not in str(cancel_res):
-                                        self.log_signal.emit("⚠️ 退课可能失败，仍尝试选课...")
+                        if current_info and not current_course_dropped:
+                            cancel_res = cancelSC(
+                                self.cookies, current_info["kcbh"], current_info["classNo"]
+                            )
+                            self.log_signal.emit(f"📝 退课结果: {cancel_res}")
+                            cancel_text = re.sub(r"\s+", "", str(cancel_res))
+                            current_course_dropped = (
+                                '"success":true' in cancel_text or "成功" in cancel_text
+                            )
+                            if not current_course_dropped:
+                                self.log_signal.emit("⚠️ 退课可能失败，仍尝试选课...")
 
-                                # ── 步骤 B: 选择目标课程 ──
-                                self.log_signal.emit(f"🚀 发起选课请求 -> {self.target_ctt_id}")
-                                cap = "1234" if self.use_cap_code else ""
-                                self.use_cap_code = False
-                                sc_res = sccourse(self.cookies, self.target_ctt_id, cap)
+                        self.log_signal.emit(f"🚀 发起选课请求 -> {target_ctt_id}")
+                        cap = "1234" if self.use_cap_code else ""
+                        self.use_cap_code = False
+                        sc_res = sccourse(self.cookies, target_ctt_id, cap)
 
-                                # 检测是否需要验证码
-                                try:
-                                    sc_json = json.loads(sc_res)
-                                    if sc_json.get("msg") == "F":
-                                        # --- 验证码处理：弹窗请求用户输入 ---
-                                        self.log_signal.emit("⚠️ 选课遇到验证码，正在请求用户输入...")
-                                        self.captcha_code = ""
-                                        self.captcha_event.clear()
-                                        self.captcha_signal.emit()
-                                        if self._wait_for_captcha(timeout=120):
-                                            real_cap = self.captcha_code
-                                            self.captcha_code = ""
-                                            if real_cap:
-                                                self.log_signal.emit(f"📝 已获取验证码，重新提交...")
-                                                sc_res = sccourse(self.cookies, self.target_ctt_id, real_cap)
-                                                # fall through to result check below
-                                            else:
-                                                self.log_signal.emit("⚠️ 验证码为空，跳过")
-                                                self.msleep(1000)
-                                                continue
-                                        else:
-                                            self.log_signal.emit("⚠️ 验证码输入超时(120s)，继续监控")
-                                            self.msleep(1000)
-                                            continue
-                                except:
-                                    pass
-
-                                if "true" in str(sc_res) or "成功" in str(sc_res):
-                                    msg = f"🎉 升级成功！{current_name} → {target_name}"
-                                    self.log_signal.emit(msg)
-                                    self.success_signal.emit(f"{self.current_ctt_id}→{self.target_ctt_id}")
-                                    if self.push_token:
-                                        send_push_notification(self.push_token, "🆙 升级课程成功", msg)
-                                    self.is_running = False
-                                    self.finished_signal.emit()
-                                    return
+                        try:
+                            sc_json = json.loads(sc_res)
+                            if sc_json.get("msg") == "F":
+                                self.log_signal.emit("⚠️ 选课遇到验证码，正在请求用户输入...")
+                                self.captcha_code = ""
+                                self.captcha_event.clear()
+                                self.captcha_signal.emit()
+                                if self._wait_for_captcha(timeout=120) and self.captcha_code:
+                                    real_cap = self.captcha_code
+                                    self.captcha_code = ""
+                                    self.log_signal.emit("📝 已获取验证码，重新提交...")
+                                    sc_res = sccourse(self.cookies, target_ctt_id, real_cap)
                                 else:
-                                    self.log_signal.emit(f"❌ 选课失败: {sc_res}")
-                                    self.log_signal.emit("💡 目标可能已被抢走，继续等待新空位...")
+                                    self.log_signal.emit("⚠️ 验证码输入超时或为空，继续监控")
+                                    continue
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            pass
 
-                            else:
-                                if self.check_count % 15 == 0:
-                                    self.log_signal.emit(f"👀 ({self.check_count}) 监控中... "
-                                                         f"[{target_name}] 满员 ({enroll}/{max_cnt})")
+                        if "true" in str(sc_res).lower() or "成功" in str(sc_res):
+                            msg = f"🎉 升级成功！{current_name} → {target_name}"
+                            self.log_signal.emit(msg)
+                            self.success_signal.emit(f"{self.current_ctt_id}→{target_ctt_id}")
+                            if self.push_token:
+                                send_push_notification(self.push_token, "🆙 升级课程成功", msg)
+                            self.is_running = False
+                            self.finished_signal.emit()
+                            return
 
-                    if not found_vacancy and self.check_count % 10 == 0:
-                        self.log_signal.emit(f"👀 ({self.check_count}) 目标课程无空位，继续监控...")
+                        self.log_signal.emit(f"❌ 选课失败: {sc_res}")
+                        self.log_signal.emit("💡 该备选课程可能已被抢走，继续检查其他备选...")
 
-                except Exception as e:
-                    self.log_signal.emit(f"❌ 升级线程异常: {e}")
-                    import traceback
-                    self.log_signal.emit(traceback.format_exc())
+                if not found_vacancy and self.check_count % 10 == 0:
+                    self.log_signal.emit(f"👀 ({self.check_count}) 所有备选课程暂无空位，继续监控...")
 
                 # 循环间隔 + 随机抖动
                 if self.interval > 0 and self.is_running:
@@ -2076,7 +2086,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.log_display.append(f"✅ 捡漏监控已启动，共 {len(selected)} 个线程")
 
     def upgrade_course_dialog(self):
-        """升级课程：输入当前已选课程 cttId 和目标课程 cttId"""
+        """升级课程：监控多个备选目标，任一出现空位即尝试升级。"""
         if self.is_running or self._stopping or self._closing:
             return
         u = self.user_combo.currentText()
@@ -2095,7 +2105,7 @@ class ProductionGlassmorphismUI(QMainWindow):
             QMessageBox.warning(self, "错误", "未找到 Cookie，请先更新！")
             return
 
-        # ── 输入两个 cttId ──
+        # ── 输入当前课程和多个备选目标 ──
         current_ctt, ok1 = self._get_text_input("升级课程 — 第一步",
             "请输入当前已选课程的课程编号 (cttId)：\n"
             "（这是你想退掉的已选课程）")
@@ -2103,39 +2113,44 @@ class ProductionGlassmorphismUI(QMainWindow):
             return
         current_ctt = current_ctt.strip()
 
-        target_ctt, ok2 = self._get_text_input("升级课程 — 第二步",
-            "请输入升级目标的课程编号 (cttId)：\n"
-            "（这是你想升级到的目标课程，有空位时自动选入）")
-        if not ok2 or not target_ctt:
+        target_text, ok2 = self._get_text_input("升级课程 — 第二步",
+            "请输入备选升级课程的课程编号 (cttId)，每行一个，也可用逗号或空格分隔：\n"
+            "（任一课程出现空位后，自动退当前课并尝试选入）", is_multiline=True)
+        if not ok2 or not target_text.strip():
             return
-        target_ctt = target_ctt.strip()
+        target_ctt_ids = list(dict.fromkeys(
+            ctt_id for ctt_id in re.split(r"[\s,，;；]+", target_text.strip()) if ctt_id
+        ))
 
-        if current_ctt == target_ctt:
+        if current_ctt in target_ctt_ids:
             QMessageBox.warning(self, "错误", "当前课程与目标课程相同，无需升级")
             return
 
         # ── 查找课程名称供确认 ──
         ctt_map = self._load_pickup_course_map()
         current_info = ctt_map.get(current_ctt)
-        target_info = ctt_map.get(target_ctt)
+        target_infos = {ctt_id: ctt_map.get(ctt_id) for ctt_id in target_ctt_ids}
+        unknown_targets = [ctt_id for ctt_id, info in target_infos.items() if info is None]
+        if unknown_targets:
+            QMessageBox.warning(
+                self, "未找到课程",
+                f"以下备选课程未在 {self.PICKUP_DATA_FILE} 中找到：\n"
+                f"{'、'.join(unknown_targets)}\n\n请先重新拉取课表后再启动升级监控。",
+            )
+            return
 
         current_name = f"{current_info['kcmc']} ({current_ctt})" if current_info else current_ctt
-        target_name = f"{target_info['kcmc']} ({target_ctt})" if target_info else target_ctt
-
-        if not target_info:
-            reply = QMessageBox.question(self, "确认",
-                f"未在 {self.PICKUP_DATA_FILE} 中找到目标课程 (cttId={target_ctt})。\n"
-                f"仍可能通过课程代码监控，是否继续？",
-                QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
+        target_summary = "\n".join(
+            f"• {target_infos[ctt_id]['kcmc']} ({ctt_id})"
+            for ctt_id in target_ctt_ids
+        )
 
         # ── 确认 ──
         reply = QMessageBox.question(self, "确认升级",
             f"将为 [{u}] 启动升级监控：\n\n"
             f"🔴 当前课程: {current_name}\n"
-            f"🟢 目标课程: {target_name}\n\n"
-            f"流程：发现目标有空位 → 退掉当前课程 → 选入目标课程\n"
+            f"🟢 备选课程：\n{target_summary}\n\n"
+            f"流程：任一备选课程有空位 → 退掉当前课程 → 选入该备选课程\n"
             f"间隔: {self.request_interval}秒\n\n"
             f"是否继续？",
             QMessageBox.Yes | QMessageBox.No)
@@ -2147,7 +2162,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.apply_glassmorphism_style()
 
         worker = UpgradeWorker(
-            cookies, u, current_ctt, target_ctt,
+            cookies, u, current_ctt, target_ctt_ids,
             self.request_interval, self.push_token
         )
         worker.log_signal.connect(self.log_display.append)
@@ -2159,7 +2174,7 @@ class ProductionGlassmorphismUI(QMainWindow):
         self.log_display.append(f"\n{'='*45}")
         self.log_display.append(f"🆙 升级监控已启动")
         self.log_display.append(f"  当前: {current_name}")
-        self.log_display.append(f"  目标: {target_name}")
+        self.log_display.append(f"  备选: {'；'.join(target_ctt_ids)}")
         self.log_display.append(f"{'='*45}")
 
         self.tabs.setCurrentIndex(1)

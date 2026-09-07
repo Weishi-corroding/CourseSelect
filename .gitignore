@@ -1,4 +1,10 @@
+# Local application data
+accounts.json
 cookies.json
+courses.json
+courses_full.json
+courses_test.json
+settings.json
 
 # Virtual environment
 .venv/
@@ -21,10 +27,28 @@ chrome/
 
 # Debug logs
 CoureseSelectDebug.log
+debug_output/
+debug_row.html
+artifacts/
 
 # IDE
 .vscode/
 .idea/
+CourseSelect.code-workspace
+CourseSelect.ifp
+
+# Local development material
+.github/
+CLAUDE.md
+dhu/
+tools/
+tests/
+test.py
+test_*.py
+test_pickup_debug.py
+test_captcha.py
+test_captcha_record.py
+msedgedriver.exe.old
 
 # OS
 Thumbs.db
